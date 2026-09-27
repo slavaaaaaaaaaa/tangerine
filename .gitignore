@@ -1,0 +1,5 @@
+# Machine-specific config (config.example.yaml is the template)
+config.yaml
+# Build output and extracted third-party source
+build/
+__pycache__/

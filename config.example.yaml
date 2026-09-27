@@ -1,0 +1,69 @@
+# tangerine configuration.
+# Copy to config.yaml, edit, then run: sudo ./install.py
+# The installed copy lives at /etc/tangerine/config.yaml; the gate picks up
+# changes to `users:` there automatically, everything else needs a re-install.
+
+# Public hostname. DNS must point here and ports 80/443 must reach this machine.
+domain: archive.example.com
+
+app:
+  # index.json files of the collections to serve.
+  indexes:
+    - /srv/archive/collection-a/index.json
+    - /srv/archive/collection-b/index.json
+  site_name: Tangerine
+  slogan: Freshly squeezed
+  footer_phrase: made with 100% pulp
+  bundles: true          # per-item .zip downloads (heavy on spinning disks)
+  logout_link: true      # add a small "log out" link to every page
+  memory_max: 12G        # systemd MemoryMax for the archive server
+  listen: 127.0.0.1:8081
+
+gate:
+  session_days: 30
+  # Push a notification on every sign-in and on password-guessing bursts.
+  # Any URL that accepts a POSTed text body works, e.g. https://ntfy.sh/<long-random-topic>
+  notify_url: ""
+  geoip: true            # city/country for each IP, via DB-IP City Lite (refreshed monthly)
+  throttle:
+    per_ip: 10           # failed logins allowed per window before lockout
+    per_user: 20
+    window_minutes: 15
+  listen: 127.0.0.1:8082
+  # Everything on the login page can be changed; these are the defaults.
+  # login_page:
+  #   title: tangerine
+  #   button: Peel
+  #   footer: Unauthorized squeezing is strictly prohibited.
+  #   goodbye: Peeled, eaten, gone. See you later.
+  #   throttled: Easy there. The tangerine needs a minute.
+  #   taglines:
+  #     - This fruit is private.
+  #     - Please do not squeeze the tangerine.
+  #   wrong_password:
+  #     - Nope. That one's a clementine.
+  #     - Hmm, that tastes like a grapefruit.
+
+nginx:
+  # Refuse requests for the bare IP or any other hostname. Turn off if this
+  # nginx also serves other sites that need to be the default server.
+  catch_all: true
+  requests_per_second: 40  # per IP, burst 400 (pages can have 100+ images)
+  logins_per_minute: 10    # per IP, login form submissions
+
+tls:
+  certbot: true            # get and renew a Let's Encrypt certificate automatically
+  email: ""                # expiry notices from Let's Encrypt; empty registers without one
+  # Or bring your own:
+  # certbot: false
+  # certificate: /etc/ssl/archive/fullchain.pem
+  # certificate_key: /etc/ssl/archive/privkey.pem
+
+fail2ban: false            # also ban password guessers at the firewall (needs fail2ban + firewalld)
+
+# Who may sign in. Set each person's password with: sudo tangerine-gate passwd NAME
+# Removing someone here signs them out within seconds.
+users:
+  alice:
+    admin: true            # admins can see the door log at /_gate/admin
+  bob:

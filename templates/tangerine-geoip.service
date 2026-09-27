@@ -1,0 +1,16 @@
+[Unit]
+Description=Refresh DB-IP city lite database for tangerine-gate
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=tangerine-gate
+Group=tangerine-gate
+StateDirectory=tangerine-gate
+ExecStart=/usr/local/bin/tangerine-geoip-update
+ExecStartPost=+/usr/bin/systemctl try-restart tangerine-gate.service
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes

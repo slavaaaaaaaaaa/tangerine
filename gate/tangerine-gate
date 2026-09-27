@@ -1,0 +1,917 @@
+#!/usr/bin/python3
+"""tangerine-gate: form login, sessions and an audit log for nginx auth_request.
+
+nginx asks GET /_gate/check on every request; we answer 204 (+ X-Tangerine-User)
+or 401. Login, logout and the admin page live under /_gate/.
+
+Who may log in comes from the `users:` section of config.yaml; password hashes
+live separately in the passwords file, managed with `tangerine-gate passwd`.
+Both files are re-read automatically when they change.
+
+Needs PyYAML; python3-maxminddb is used for IP geolocation when installed.
+
+    tangerine-gate serve
+    tangerine-gate passwd NAME [--random | --delete]
+    tangerine-gate users
+    tangerine-gate log [-n N] [--user NAME] [--failed]
+    tangerine-gate sessions
+    tangerine-gate revoke (SID | --user NAME)
+"""
+import argparse
+import base64
+import getpass
+import hashlib
+import hmac
+import html
+import http.server
+import ipaddress
+import json
+import os
+import pwd
+import random
+import re
+import secrets
+import socket
+import sqlite3
+import sys
+import threading
+import time
+import urllib.parse
+import urllib.request
+
+import yaml
+
+CONFIG_FILE = os.environ.get("TANGERINE_CONFIG", "/etc/tangerine/config.yaml")
+STATE_DIR = os.environ.get("TANGERINE_STATE", "/var/lib/tangerine-gate")
+COOKIE_SECURE = os.environ.get("TANGERINE_INSECURE_COOKIE") != "1"  # for local testing only
+SERVICE_USER = "tangerine-gate"
+COOKIE = "tangerine"
+
+SCRYPT = dict(n=2**15, r=8, p=1)
+SCRYPT_MAXMEM = 64 * 1024 * 1024
+USERNAME_RE = re.compile(r"^[a-z0-9_.-]{1,32}$")
+
+GATE_DEFAULTS = {
+    "listen": "127.0.0.1:8082",
+    "passwords_file": "/etc/tangerine/passwords",
+    "session_days": 30,
+    "notify_url": "",
+    "geoip": True,
+    "throttle": {"per_ip": 10, "per_user": 20, "window_minutes": 15},
+    "login_page": {
+        "title": "tangerine",
+        "button": "Peel",
+        "footer": "Unauthorized squeezing is strictly prohibited.",
+        "goodbye": "Peeled, eaten, gone. See you later.",
+        "throttled": "Easy there. The tangerine needs a minute.",
+        "taglines": [
+            "This fruit is private.",
+            "Please do not squeeze the tangerine.",
+            "Members only. The tangerine has a strict door policy.",
+            "No peeking under the peel.",
+            "You must be at least this orange to enter.",
+            "A citrus of few words.",
+        ],
+        "wrong_password": [
+            "Nope. That one's a clementine.",
+            "That's not the secret handshake.",
+            "Hmm, that tastes like a grapefruit.",
+            "The tangerine does not recognize you.",
+        ],
+    },
+}
+
+
+def merged(defaults, override):
+    out = dict(defaults)
+    for k, v in (override or {}).items():
+        out[k] = merged(defaults[k], v) if isinstance(defaults.get(k), dict) and isinstance(v, dict) else v
+    return out
+
+
+def load_config(path=CONFIG_FILE):
+    with open(path) as f:
+        return yaml.safe_load(f) or {}
+
+
+def gate_settings(config):
+    return merged(GATE_DEFAULTS, config.get("gate"))
+
+
+def config_users(config):
+    """users: {name: {admin: bool}} -> {name: set(flags)}"""
+    out = {}
+    for name, opts in (config.get("users") or {}).items():
+        name = str(name).lower()
+        if USERNAME_RE.match(name):
+            out[name] = {"admin"} if (opts or {}).get("admin") else set()
+    return out
+
+
+# Replaced in main() once config.yaml is read.
+S = gate_settings({})
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def b64e(b):
+    return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+
+
+def b64d(s):
+    return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+
+
+# ---------------------------------------------------------------- passwords
+
+def hash_password(pw):
+    salt = secrets.token_bytes(16)
+    dk = hashlib.scrypt(pw.encode(), salt=salt, maxmem=SCRYPT_MAXMEM, dklen=32, **SCRYPT)
+    return "scrypt$%d$%d$%d$%s$%s" % (SCRYPT["n"], SCRYPT["r"], SCRYPT["p"], b64e(salt), b64e(dk))
+
+
+def verify_password(pw, stored):
+    try:
+        kind, n, r, p, salt, dk = stored.split("$")
+        if kind != "scrypt":
+            return False
+        want = b64d(dk)
+        got = hashlib.scrypt(pw.encode(), salt=b64d(salt), n=int(n), r=int(r), p=int(p),
+                             maxmem=SCRYPT_MAXMEM, dklen=len(want))
+        return hmac.compare_digest(got, want)
+    except Exception:
+        return False
+
+
+# Verified against when the username doesn't exist, so timing doesn't reveal it.
+DUMMY_HASH = hash_password(secrets.token_hex(8))
+
+
+def password_gen(stored):
+    """Changes whenever the password does; baked into cookies so passwd/userdel log people out."""
+    return hashlib.sha256(stored.encode()).hexdigest()[:16]
+
+
+# ---------------------------------------------------------------- passwords file
+# One line per user:  name:scrypt$...   (written only by `tangerine-gate passwd`)
+
+def read_passwords(path):
+    out = {}
+    try:
+        f = open(path)
+    except FileNotFoundError:
+        return out
+    with f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#") and ":" in line:
+                name, _, h = line.partition(":")
+                out[name] = h
+    return out
+
+
+def write_passwords(passwords, path):
+    lines = ["# tangerine password hashes -- manage with: tangerine-gate passwd NAME"]
+    lines += ["%s:%s" % (n, passwords[n]) for n in sorted(passwords)]
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o640)
+    with os.fdopen(fd, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    try:
+        st = os.stat(path)
+        os.chown(tmp, st.st_uid, st.st_gid)
+        os.chmod(tmp, st.st_mode & 0o777)
+    except FileNotFoundError:
+        pass
+    os.replace(tmp, path)
+
+
+class Users:
+    """Users allowed by config.yaml that have a password set. Both files are
+    re-read (checked at most every 2s) when their mtime changes."""
+
+    def __init__(self, config_path, passwords_path):
+        self.paths = (config_path, passwords_path)
+        self.mtimes = None
+        self.checked = 0.0
+        self.users = {}
+        self.lock = threading.Lock()
+
+    def get(self):
+        with self.lock:
+            now = time.monotonic()
+            if now - self.checked > 2:
+                self.checked = now
+                mtimes = []
+                for p in self.paths:
+                    try:
+                        mtimes.append(os.stat(p).st_mtime_ns)
+                    except FileNotFoundError:
+                        mtimes.append(None)
+                if mtimes != self.mtimes:
+                    try:
+                        allowed = config_users(load_config(self.paths[0]))
+                    except Exception as e:
+                        log("config reload failed, keeping previous users: %s" % e)
+                        return self.users
+                    hashes = read_passwords(self.paths[1])
+                    self.users = {n: {"hash": hashes[n], "flags": flags}
+                                  for n, flags in allowed.items() if n in hashes}
+                    self.mtimes = mtimes
+            return self.users
+
+
+# ---------------------------------------------------------------- where is this IP
+
+class Geo:
+    def __init__(self, path):
+        self.reader = None
+        self.cache = {}
+        self.lock = threading.Lock()
+        if not path:
+            log("geoip: disabled in config")
+            return
+        try:
+            import maxminddb
+            self.reader = maxminddb.open_database(path)
+            log("geoip: using %s" % path)
+        except Exception as e:
+            log("geoip: disabled (%s)" % e)
+
+    def lookup(self, ip):
+        with self.lock:
+            if ip in self.cache:
+                return self.cache[ip]
+        try:
+            addr = ipaddress.ip_address(ip)
+        except ValueError:
+            return ""
+        if addr.is_private or addr.is_loopback:
+            where = "local network"
+        elif not self.reader:
+            where = ""
+        else:
+            try:
+                r = self.reader.get(ip) or {}
+            except Exception:
+                r = {}
+            city = r.get("city", {}).get("names", {}).get("en")
+            region = (r.get("subdivisions") or [{}])[0].get("names", {}).get("en")
+            country = r.get("country", {}).get("names", {}).get("en") or r.get("country", {}).get("iso_code")
+            where = ", ".join(x for x in (city, region, country) if x)
+        with self.lock:
+            if len(self.cache) > 10000:
+                self.cache.clear()
+            self.cache[ip] = where
+        return where
+
+
+def notify(title, message):
+    """POST to gate.notify_url (ntfy-style: body is the message, Title header)."""
+    if not S["notify_url"]:
+        return
+
+    def send():
+        try:
+            req = urllib.request.Request(S["notify_url"], data=message.encode(),
+                                         headers={"Title": title, "Tags": "tangerine"})
+            urllib.request.urlopen(req, timeout=10).close()
+        except Exception as e:
+            log("notify failed: %s" % e)
+
+    threading.Thread(target=send, daemon=True).start()
+
+
+# ---------------------------------------------------------------- audit log + sessions
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS events (
+    id INTEGER PRIMARY KEY, ts REAL NOT NULL, event TEXT NOT NULL, user TEXT,
+    ip TEXT, rdns TEXT, geo TEXT, ua TEXT, detail TEXT);
+CREATE INDEX IF NOT EXISTS events_ts ON events(ts);
+CREATE INDEX IF NOT EXISTS events_user ON events(user, ts);
+CREATE TABLE IF NOT EXISTS sessions (
+    sid TEXT PRIMARY KEY, user TEXT NOT NULL, created REAL NOT NULL, expires REAL NOT NULL,
+    last_seen REAL, ip TEXT, geo TEXT, ua TEXT, requests INTEGER NOT NULL DEFAULT 0,
+    revoked INTEGER NOT NULL DEFAULT 0);
+"""
+
+
+def open_db():
+    db = sqlite3.connect(os.path.join(STATE_DIR, "audit.db"), check_same_thread=False,
+                         isolation_level=None, timeout=10)
+    db.row_factory = sqlite3.Row
+    db.execute("PRAGMA journal_mode=WAL")
+    db.executescript(SCHEMA)
+    return db
+
+
+class Audit:
+    def __init__(self, geo):
+        self.geo = geo
+        self.db = open_db()
+        self.lock = threading.Lock()
+        self.rdns_cache = {}
+        self.dirty = set()
+        now = time.time()
+        rows = self.db.execute("SELECT * FROM sessions WHERE revoked = 0 AND expires > ?", (now,))
+        self.sessions = {r["sid"]: dict(r) for r in rows}
+        threading.Thread(target=self._flush_loop, daemon=True).start()
+
+    def event(self, event, user, ip, ua, detail=""):
+        user = (user or "")[:64]
+        ua = (ua or "")[:300]
+        where = self.geo.lookup(ip)
+        with self.lock:
+            eid = self.db.execute(
+                "INSERT INTO events (ts, event, user, ip, geo, ua, detail) VALUES (?,?,?,?,?,?,?)",
+                (time.time(), event, user, ip, where, ua, detail)).lastrowid
+        # ip= must stay last: fail2ban anchors on it, and every other field is attacker-controlled.
+        log("%s user=%r geo=%r ua=%r %sip=%s" % (event, user, where, ua,
+                                                  (detail + " ") if detail else "", ip))
+        threading.Thread(target=self._rdns, args=(eid, ip), daemon=True).start()
+        return where
+
+    def _rdns(self, eid, ip):
+        name = self.rdns_cache.get(ip)
+        if name is None:
+            try:
+                name = socket.gethostbyaddr(ip)[0]
+            except Exception:
+                name = ""
+            self.rdns_cache[ip] = name
+        if name:
+            with self.lock:
+                self.db.execute("UPDATE events SET rdns = ? WHERE id = ?", (name, eid))
+
+    def seen_before(self, user, ip):
+        with self.lock:
+            return self.db.execute("SELECT 1 FROM events WHERE event = 'login' AND user = ? AND ip = ? LIMIT 1",
+                                   (user, ip)).fetchone() is not None
+
+    def new_session(self, user, ip, ua):
+        now = time.time()
+        s = {"sid": secrets.token_urlsafe(16), "user": user, "created": now,
+             "expires": now + S["session_days"] * 86400, "last_seen": now, "ip": ip,
+             "geo": self.geo.lookup(ip), "ua": (ua or "")[:300], "requests": 0, "revoked": 0}
+        with self.lock:
+            self.db.execute("INSERT INTO sessions VALUES (:sid,:user,:created,:expires,:last_seen,"
+                            ":ip,:geo,:ua,:requests,:revoked)", s)
+            self.sessions[s["sid"]] = s
+        return s
+
+    def touch(self, sid, ip, ua):
+        """Called on every proxied request. Returns the live session or None."""
+        with self.lock:
+            s = self.sessions.get(sid)
+            if not s or s["revoked"] or s["expires"] < time.time():
+                return None
+            s["last_seen"] = time.time()
+            s["requests"] += 1
+            moved = s["ip"] != ip
+            if moved:
+                old, s["ip"], s["ua"] = s["ip"], ip, (ua or "")[:300]
+            self.dirty.add(sid)
+        if moved:
+            s["geo"] = self.event("session_ip_change", s["user"], ip, ua, "from=%s" % old)
+        return s
+
+    def revoke(self, sid):
+        with self.lock:
+            self.db.execute("UPDATE sessions SET revoked = 1 WHERE sid = ?", (sid,))
+            s = self.sessions.pop(sid, None)
+        return s
+
+    def _flush_loop(self):
+        while True:
+            time.sleep(30)
+            try:
+                self.flush()
+            except Exception as e:
+                log("flush failed: %s" % e)
+
+    def flush(self):
+        now = time.time()
+        with self.lock:
+            for sid in self.dirty:
+                s = self.sessions.get(sid)
+                if s:
+                    self.db.execute("UPDATE sessions SET last_seen=?, ip=?, geo=?, ua=?, requests=? "
+                                    "WHERE sid=?", (s["last_seen"], s["ip"], s["geo"], s["ua"],
+                                                    s["requests"], sid))
+            self.dirty.clear()
+            # Pick up revocations made from the CLI.
+            for r in self.db.execute("SELECT sid FROM sessions WHERE revoked = 1 AND last_seen > ?",
+                                     (now - S["session_days"] * 86400,)):
+                self.sessions.pop(r["sid"], None)
+            for sid in [k for k, s in self.sessions.items() if s["expires"] < now]:
+                del self.sessions[sid]
+
+    def recent_events(self, limit=200, user=None):
+        q, args = "SELECT * FROM events", []
+        if user:
+            q, args = q + " WHERE user = ?", [user]
+        with self.lock:
+            return self.db.execute(q + " ORDER BY ts DESC LIMIT ?", args + [limit]).fetchall()
+
+
+class Throttle:
+    """Sliding window failure counter."""
+
+    def __init__(self, limit, window):
+        self.limit, self.window = limit, window
+        self.hits = {}
+        self.lock = threading.Lock()
+
+    def _prune(self, key):
+        cutoff = time.time() - self.window
+        hits = [t for t in self.hits.get(key, []) if t > cutoff]
+        if hits:
+            self.hits[key] = hits
+        else:
+            self.hits.pop(key, None)
+        return hits
+
+    def blocked(self, key):
+        with self.lock:
+            return len(self._prune(key)) >= self.limit
+
+    def hit(self, key):
+        """Record a failure; True when this one tripped the limit."""
+        with self.lock:
+            hits = self._prune(key)
+            hits.append(time.time())
+            self.hits[key] = hits
+            return len(hits) == self.limit
+
+
+# ---------------------------------------------------------------- cookies
+
+def sign(secret, payload):
+    body = b64e(json.dumps(payload, separators=(",", ":")).encode())
+    return body + "." + b64e(hmac.new(secret, body.encode(), hashlib.sha256).digest())
+
+
+def unsign(secret, token):
+    try:
+        body, mac = token.split(".")
+        want = b64e(hmac.new(secret, body.encode(), hashlib.sha256).digest())
+        if not hmac.compare_digest(mac, want):
+            return None
+        return json.loads(b64d(body))
+    except Exception:
+        return None
+
+
+def load_secret():
+    path = os.path.join(STATE_DIR, "secret")
+    try:
+        with open(path, "rb") as f:
+            return f.read()
+    except FileNotFoundError:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        key = secrets.token_bytes(32)
+        with os.fdopen(fd, "wb") as f:
+            f.write(key)
+        return key
+
+
+# ---------------------------------------------------------------- pages
+
+CSS = """
+:root{--bg:#fbf6ef;--card:#fff;--ink:#2b2118;--muted:#8a7a6a;--line:#eadfce;--accent:#e8741c;--accent-ink:#fff;--bad:#b3261e;--field:#fffdf9;color-scheme:light}
+@media (prefers-color-scheme:dark){:root{--bg:#1c1712;--card:#26201a;--ink:#f3e9dc;--muted:#a8998a;--line:#3a3129;--accent:#f08a3a;--accent-ink:#1c1712;--bad:#ff8a80;--field:#1f1a15;color-scheme:dark}}
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;background:var(--bg);color:var(--ink);font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;padding:24px 16px}
+.wrap{max-width:360px;margin:8vh auto 0;text-align:center}
+.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:28px 24px;box-shadow:0 1px 2px rgba(0,0,0,.04),0 8px 24px rgba(120,70,20,.06)}
+h1{font-size:22px;letter-spacing:.02em;margin:10px 0 2px;font-weight:650}
+.tag{color:var(--muted);margin:0 0 20px}
+form{text-align:left}
+label{display:block;font-size:13px;color:var(--muted);margin:12px 0 4px}
+input{width:100%;font:inherit;padding:10px 12px;border:1px solid var(--line);border-radius:10px;background:var(--field);color:var(--ink)}
+input:focus{outline:2px solid var(--accent);outline-offset:-1px;border-color:transparent}
+button{margin-top:20px;width:100%;font:inherit;font-weight:600;padding:10px;border:0;border-radius:10px;background:var(--accent);color:var(--accent-ink);cursor:pointer}
+button:hover{filter:brightness(1.05)}
+.msg{margin:0 0 8px;padding:8px 10px;border-radius:8px;font-size:14px;text-align:center}
+.msg.bad{color:var(--bad);background:color-mix(in srgb,var(--bad) 10%,transparent)}
+.msg.ok{color:var(--muted);background:color-mix(in srgb,var(--accent) 10%,transparent)}
+.foot{color:var(--muted);font-size:12px;margin-top:18px}
+.fruit{display:inline-block;transition:transform .4s}
+.fruit:hover{transform:rotate(-12deg)}
+"""
+
+FRUIT = """<svg class="fruit" viewBox="0 0 64 64" width="64" height="64" aria-hidden="true">
+<circle cx="32" cy="37" r="22" fill="#f28c28"/>
+<circle cx="24" cy="29" r="6" fill="#ffc07a" opacity=".55"/>
+<g fill="#d9701a" opacity=".5"><circle cx="40" cy="44" r="1.2"/><circle cx="34" cy="50" r="1.2"/><circle cx="45" cy="36" r="1.2"/><circle cx="27" cy="46" r="1.2"/></g>
+<path d="M32 16c0-4 1.5-7 4.5-9" stroke="#6b4f2a" stroke-width="2.5" fill="none" stroke-linecap="round"/>
+<path d="M35 13c6-6 14-5 18-2-5 5-12 6-18 2z" fill="#4c9a3b"/>
+</svg>"""
+
+
+def page(title, body, width=360):
+    return ("<!doctype html><html lang=en><head><meta charset=utf-8>"
+            "<meta name=viewport content='width=device-width,initial-scale=1'>"
+            "<meta name=robots content='noindex,nofollow'>"
+            "<title>%s</title><style>%s .wrap{max-width:%dpx}</style></head><body>%s</body></html>"
+            % (html.escape(title), CSS, width, body))
+
+
+def login_page(next_url="/", message="", kind="bad"):
+    lp = S["login_page"]
+    msg = '<p class="msg %s">%s</p>' % (kind, html.escape(message)) if message else ""
+    return page(lp["title"], """<main class="wrap"><div class="card">%s
+<h1>%s</h1><p class="tag">%s</p>
+<form method="post" action="/_gate/login">%s
+<input type="hidden" name="next" value="%s">
+<label for="u">Name</label><input id="u" name="user" autocomplete="username" autocapitalize="none" spellcheck="false" required autofocus>
+<label for="p">Password</label><input id="p" name="password" type="password" autocomplete="current-password" required>
+<button type="submit">%s</button></form></div>
+<p class="foot">%s</p></main>"""
+                % (FRUIT, html.escape(lp["title"]), html.escape(random.choice(lp["taglines"] or [""])), msg,
+                   html.escape(next_url), html.escape(lp["button"]), html.escape(lp["footer"])))
+
+
+def fmt_ts(ts):
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts)) if ts else ""
+
+
+def ago(ts):
+    if not ts:
+        return ""
+    d = int(time.time() - ts)
+    for unit, n in (("d", 86400), ("h", 3600), ("m", 60)):
+        if d >= n:
+            return "%d%s ago" % (d // n, unit)
+    return "just now"
+
+
+def short_ua(ua):
+    ua = ua or ""
+    os_name = next((n for k, n in (("iPhone", "iPhone"), ("iPad", "iPad"), ("Android", "Android"),
+                                   ("CrOS", "ChromeOS"), ("Mac OS X", "macOS"), ("Windows", "Windows"),
+                                   ("Linux", "Linux")) if k in ua), "")
+    browser = next((n for k, n in (("Edg/", "Edge"), ("OPR/", "Opera"), ("FxiOS", "Firefox"),
+                                   ("Firefox/", "Firefox"), ("CriOS", "Chrome"), ("Chrome/", "Chrome"),
+                                   ("Safari/", "Safari"), ("curl/", "curl")) if k in ua), "")
+    if not browser:
+        return ua[:40] or "?"
+    return browser + (" on " + os_name if os_name else "")
+
+
+# ---------------------------------------------------------------- HTTP
+
+def safe_next(url):
+    if (not url or not url.startswith("/") or url.startswith("//") or "\\" in url
+            or url.startswith("/_gate/") or any(ord(c) < 0x21 or ord(c) == 0x7f for c in url)):
+        return "/"
+    return url
+
+
+class Gate:
+    def __init__(self):
+        self.secret = load_secret()
+        self.users = Users(CONFIG_FILE, S["passwords_file"])
+        self.audit = Audit(Geo(os.path.join(STATE_DIR, "dbip-city-lite.mmdb") if S["geoip"] else None))
+        t = S["throttle"]
+        self.fail_ip = Throttle(t["per_ip"], t["window_minutes"] * 60)
+        self.fail_user = Throttle(t["per_user"], t["window_minutes"] * 60)
+
+    def authenticate(self, name, password):
+        u = self.users.get().get(name)
+        ok = verify_password(password, u["hash"] if u else DUMMY_HASH)
+        return u if (ok and u) else None
+
+    def session_from(self, cookie_header, ip, ua):
+        token = None
+        for part in (cookie_header or "").split(";"):
+            k, _, v = part.strip().partition("=")
+            if k == COOKIE:
+                token = v
+        p = unsign(self.secret, token) if token else None
+        if not p or p.get("exp", 0) < time.time():
+            return None, None
+        u = self.users.get().get(p.get("u"))
+        if not u or password_gen(u["hash"]) != p.get("g"):
+            return None, None
+        s = self.audit.touch(p.get("sid"), ip, ua)
+        return (s, u) if s else (None, None)
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    server_version = "tangerine"
+    sys_version = ""
+    gate: Gate = None
+
+    def log_message(self, *args):
+        pass
+
+    @property
+    def ip(self):
+        if self.client_address[0] in ("127.0.0.1", "::1"):
+            real = (self.headers.get("X-Real-IP") or "").strip()
+            if real:
+                return real
+        return self.client_address[0]
+
+    @property
+    def ua(self):
+        return self.headers.get("User-Agent", "")
+
+    def session(self):
+        return self.gate.session_from(self.headers.get("Cookie"), self.ip, self.ua)
+
+    def send(self, status, body=b"", headers=()):
+        if isinstance(body, str):
+            body = body.encode()
+        self.send_response(status)
+        self.send_header("Cache-Control", "no-store")
+        for k, v in headers:
+            self.send_header(k, v)
+        if body:
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; "
+                             "img-src data:; form-action 'self'; frame-ancestors 'none'; base-uri 'none'")
+            self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def redirect(self, location, cookie=None):
+        headers = [("Location", location)]
+        if cookie is not None:
+            headers.append(("Set-Cookie", cookie))
+        self.send(303, headers=headers)
+
+    def cookie(self, value, max_age):
+        return "%s=%s; Path=/; Max-Age=%d; HttpOnly; SameSite=Lax%s" % (
+            COOKIE, value, max_age, "; Secure" if COOKIE_SECURE else "")
+
+    def form(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        if n > 8192:
+            return {}
+        data = self.rfile.read(n).decode("utf-8", "replace")
+        return {k: v[0] for k, v in urllib.parse.parse_qs(data, keep_blank_values=True).items()}
+
+    # -- routing
+
+    def do_HEAD(self):
+        self.do_GET()
+
+    def do_GET(self):
+        path, _, query = self.path.partition("?")
+        if path == "/_gate/check":
+            return self.check()
+        if path == "/_gate/login":
+            return self.login_get(query)
+        if path == "/_gate/logout":
+            return self.logout()
+        if path == "/_gate/admin":
+            return self.admin(query)
+        self.send(404, "not here")
+
+    def do_POST(self):
+        path = self.path.partition("?")[0]
+        if path == "/_gate/login":
+            return self.login_post()
+        if path == "/_gate/admin/revoke":
+            return self.admin_revoke()
+        self.send(404, "not here")
+
+    # -- endpoints
+
+    def check(self):
+        s, _ = self.session()
+        if s:
+            self.send(204, headers=[("X-Tangerine-User", s["user"])])
+        else:
+            self.send(401)
+
+    def login_get(self, query):
+        if query == "bye":
+            return self.send(200, login_page("/", S["login_page"]["goodbye"], "ok"))
+        # nginx passes $request_uri through unescaped, so take everything after next=.
+        nxt = query[5:] if query.startswith("next=") else "/"
+        s, _ = self.session()
+        if s:
+            return self.redirect(safe_next(nxt))
+        self.send(200, login_page(safe_next(nxt)))
+
+    def login_post(self):
+        f = self.form()
+        name = f.get("user", "").strip().lower()
+        nxt = safe_next(f.get("next", "/"))
+        ip, ua, audit = self.ip, self.ua, self.gate.audit
+        if self.gate.fail_ip.blocked(ip) or self.gate.fail_user.blocked(name):
+            audit.event("login_throttled", name, ip, ua)
+            return self.send(429, login_page(nxt, S["login_page"]["throttled"]))
+        u = self.gate.authenticate(name, f.get("password", ""))
+        if not u:
+            where = audit.event("login_failed", name, ip, ua)
+            tripped_ip = self.gate.fail_ip.hit(ip)
+            tripped_user = self.gate.fail_user.hit(name)
+            if tripped_ip or tripped_user:
+                notify("tangerine: someone is guessing passwords",
+                       "%d+ failed logins, last as %r from %s (%s)" % (
+                           self.gate.fail_ip.limit, name, ip, where or "unknown location"))
+            return self.send(401, login_page(nxt, random.choice(S["login_page"]["wrong_password"] or ["Nope."])))
+        new_ip = not audit.seen_before(name, ip)
+        s = audit.new_session(name, ip, ua)
+        where = audit.event("login", name, ip, ua, "new_ip" if new_ip else "")
+        notify("tangerine: %s signed in%s" % (name, " from a new IP" if new_ip else ""),
+               "%s from %s (%s)\n%s" % (name, ip, where or "unknown location", short_ua(ua)))
+        token = sign(self.gate.secret, {"u": name, "sid": s["sid"], "g": password_gen(u["hash"]),
+                                        "exp": int(s["expires"])})
+        self.redirect(nxt, self.cookie(token, S["session_days"] * 86400))
+
+    def logout(self):
+        s, _ = self.session()
+        if s:
+            self.gate.audit.revoke(s["sid"])
+            self.gate.audit.event("logout", s["user"], self.ip, self.ua)
+        self.redirect("/_gate/login?bye", self.cookie("", 0))
+
+    def admin(self, query):
+        s, u = self.session()
+        if not s:
+            return self.redirect("/_gate/login?next=/_gate/admin")
+        if "admin" not in u["flags"]:
+            return self.send(403, page(S["login_page"]["title"], '<main class="wrap"><div class="card">%s<h1>Not for you</h1>'
+                                       '<p class="tag">This part of the tangerine is staff only.</p>'
+                                       '<p><a href="/">Back</a></p></div></main>' % FRUIT))
+        user = urllib.parse.parse_qs(query).get("user", [None])[0]
+        self.send(200, admin_page(self.gate, user))
+
+    def admin_revoke(self):
+        s, u = self.session()
+        if not s or "admin" not in u["flags"]:
+            return self.send(403, "no")
+        origin = urllib.parse.urlparse(self.headers.get("Origin", "")).netloc
+        if not origin or origin != self.headers.get("Host"):
+            return self.send(403, "bad origin")
+        sid = self.form().get("sid", "")
+        victim = self.gate.audit.revoke(sid)
+        if victim:
+            self.gate.audit.event("session_revoked", victim["user"], self.ip, self.ua, "by=%s" % s["user"])
+        self.redirect("/_gate/admin")
+
+
+def admin_page(gate, only_user=None):
+    e = html.escape
+    audit = gate.audit
+    with audit.lock:
+        live = sorted(audit.sessions.values(), key=lambda s: -(s["last_seen"] or 0))
+    rows = []
+    for s in live:
+        rows.append("<tr><td><a href='?user=%s'>%s</a></td><td title='%s'>%s</td><td>%s</td><td>%s</td>"
+                    "<td title='%s'>%s</td><td>%d</td><td>%s</td><td><form method=post action='/_gate/admin/revoke'>"
+                    "<input type=hidden name=sid value='%s'><button class=mini>kick</button></form></td></tr>" % (
+                        e(urllib.parse.quote(s["user"])), e(s["user"]), e(fmt_ts(s["last_seen"])),
+                        e(ago(s["last_seen"])), e(s["ip"] or ""), e(s["geo"] or ""), e(s["ua"] or ""),
+                        e(short_ua(s["ua"])), s["requests"], e(fmt_ts(s["created"])), e(s["sid"])))
+    events = []
+    for r in audit.recent_events(300, only_user):
+        cls = "bad" if r["event"] in ("login_failed", "login_throttled") else ""
+        events.append("<tr class='%s'><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td>"
+                      "<td title='%s'>%s</td><td>%s</td></tr>" % (
+                          cls, e(fmt_ts(r["ts"])), e(r["event"]), e(r["user"] or ""), e(r["ip"] or ""),
+                          e(r["rdns"] or ""), e(r["geo"] or ""), e(r["ua"] or ""), e(short_ua(r["ua"])),
+                          e(r["detail"] or "")))
+    users = gate.users.get()
+    filt = (" &middot; showing <b>%s</b> &middot; <a href='/_gate/admin'>everyone</a>" % e(only_user)) if only_user else ""
+    body = """<main class="wrap" style="text-align:left"><h1>%s %s &middot; door log</h1>
+<p class="tag">%d users &middot; %d live sessions &middot; times in %s%s &middot; <a href="/">back</a></p>
+<h2>Who's here</h2><div class=scroll><table><tr><th>user</th><th>last seen</th><th>ip</th><th>where</th>
+<th>browser</th><th>requests</th><th>signed in</th><th></th></tr>%s</table></div>
+<h2>Door log</h2><div class=scroll><table><tr><th>time</th><th>event</th><th>user</th><th>ip</th><th>host</th>
+<th>where</th><th>browser</th><th>detail</th></tr>%s</table></div>
+<p class="foot"><a href="https://db-ip.com">IP Geolocation by DB-IP</a></p></main>
+<style>h2{font-size:16px;margin:28px 0 8px}.scroll{overflow-x:auto;border:1px solid var(--line);border-radius:12px;background:var(--card)}
+table{border-collapse:collapse;width:100%%;font-size:13px}th,td{padding:6px 10px;text-align:left;white-space:nowrap;border-bottom:1px solid var(--line)}
+th{color:var(--muted);font-weight:500}tr.bad td{color:var(--bad)}.fruit{width:28px;height:28px;vertical-align:-6px}
+a{color:var(--accent)}button.mini{margin:0;width:auto;padding:2px 10px;font-size:12px}</style>""" % (
+        FRUIT, e(S["login_page"]["title"]), len(users), len(live), e(time.strftime("%Z")), filt,
+        "".join(rows) or "<tr><td colspan=8>nobody</td></tr>",
+        "".join(events) or "<tr><td colspan=8>nothing yet</td></tr>")
+    return page(S["login_page"]["title"] + " door log", body, width=1200)
+
+
+def serve():
+    Handler.gate = Gate()
+    host, _, port = S["listen"].rpartition(":")
+    srv = http.server.ThreadingHTTPServer((host.strip("[]"), int(port)), Handler)
+    srv.daemon_threads = True
+    log("tangerine-gate listening on %s (%d users)" % (S["listen"], len(Handler.gate.users.get())))
+    srv.serve_forever()
+
+
+# ---------------------------------------------------------------- CLI
+
+def drop_to_service_user():
+    """DB commands run as the service user so root never owns audit.db or its WAL files."""
+    if os.geteuid() == 0:
+        pw = pwd.getpwnam(SERVICE_USER)
+        os.setgroups([])
+        os.setgid(pw.pw_gid)
+        os.setuid(pw.pw_uid)
+
+
+def ask_password(random_pw):
+    if random_pw:
+        pw = secrets.token_urlsafe(12)
+        print("password: %s" % pw)
+        return pw
+    pw = getpass.getpass("password: ")
+    if len(pw) < 10:
+        sys.exit("use at least 10 characters (or --random)")
+    if getpass.getpass("again: ") != pw:
+        sys.exit("passwords don't match")
+    return pw
+
+
+def main():
+    global S
+    ap = argparse.ArgumentParser(prog="tangerine-gate")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("serve")
+    p = sub.add_parser("passwd", help="set (or --delete) a user's password")
+    p.add_argument("name"); p.add_argument("--random", action="store_true"); p.add_argument("--delete", action="store_true")
+    sub.add_parser("users", help="users from config.yaml, password status, last login")
+    p = sub.add_parser("log", help="door log")
+    p.add_argument("-n", type=int, default=50); p.add_argument("--user"); p.add_argument("--failed", action="store_true")
+    sub.add_parser("sessions", help="live sessions")
+    p = sub.add_parser("revoke", help="end a session, or all of a user's sessions")
+    p.add_argument("sid", nargs="?"); p.add_argument("--user")
+    a = ap.parse_args()
+
+    config = load_config()
+    S = gate_settings(config)
+    allowed = config_users(config)
+
+    if a.cmd == "serve":
+        return serve()
+
+    if a.cmd == "passwd":
+        name = a.name.lower()
+        passwords = read_passwords(S["passwords_file"])
+        if a.delete:
+            if passwords.pop(name, None) is None:
+                sys.exit("%s has no password set" % name)
+        else:
+            if name not in allowed:
+                sys.exit("%s is not listed under users: in %s -- add them there first" % (name, CONFIG_FILE))
+            passwords[name] = hash_password(ask_password(a.random))
+        write_passwords(passwords, S["passwords_file"])
+        print("%s: password %s (their existing sessions end within a few seconds)"
+              % (name, "deleted" if a.delete else "set"))
+        return
+
+    passwords = read_passwords(S["passwords_file"])
+    drop_to_service_user()
+    db = open_db()
+    if a.cmd == "users":
+        for name in sorted(set(allowed) | set(passwords)):
+            r = db.execute("SELECT ts, ip, geo FROM events WHERE user = ? AND event = 'login' "
+                           "ORDER BY ts DESC LIMIT 1", (name,)).fetchone()
+            last = "%s from %s (%s)" % (fmt_ts(r["ts"]), r["ip"], r["geo"]) if r else "never"
+            if name not in allowed:
+                status = "not in config (password left over; passwd --delete)"
+            elif name not in passwords:
+                status = "no password yet"
+            else:
+                status = "ok"
+            print("%-16s %-6s %-14s last login: %s" % (
+                name, ",".join(sorted(allowed.get(name, ()))), status, last))
+    elif a.cmd == "log":
+        q, args = "SELECT * FROM events WHERE 1=1", []
+        if a.user:
+            q += " AND user = ?"; args.append(a.user)
+        if a.failed:
+            q += " AND event IN ('login_failed', 'login_throttled')"
+        for r in reversed(db.execute(q + " ORDER BY ts DESC LIMIT ?", args + [a.n]).fetchall()):
+            print("%s  %-18s %-12s %-39s %-30s %s  %s %s" % (
+                fmt_ts(r["ts"]), r["event"], r["user"], r["ip"], r["geo"] or "", r["rdns"] or "",
+                short_ua(r["ua"]), r["detail"] or ""))
+    elif a.cmd == "sessions":
+        for r in db.execute("SELECT * FROM sessions WHERE revoked = 0 AND expires > ? ORDER BY last_seen DESC",
+                            (time.time(),)):
+            print("%s  %-12s last seen %-10s %-39s %-30s %6d reqs  %s" % (
+                r["sid"], r["user"], ago(r["last_seen"]), r["ip"], r["geo"] or "", r["requests"],
+                short_ua(r["ua"])))
+    elif a.cmd == "revoke":
+        if a.user:
+            n = db.execute("UPDATE sessions SET revoked = 1 WHERE user = ? AND revoked = 0", (a.user,)).rowcount
+        elif a.sid:
+            n = db.execute("UPDATE sessions SET revoked = 1 WHERE sid = ?", (a.sid,)).rowcount
+        else:
+            sys.exit("give a session id or --user")
+        print("revoked %d session(s); takes effect within 30s" % n)
+
+
+if __name__ == "__main__":
+    main()

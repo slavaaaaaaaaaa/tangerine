@@ -1,0 +1,13 @@
+#!/bin/bash
+# Fetch this month's DB-IP City Lite (CC BY 4.0) into the gate's state dir.
+set -euo pipefail
+dir=/var/lib/tangerine-gate
+month=$(date -u +%Y-%m)
+tmp=$(mktemp "$dir/.dbip.XXXXXX")
+trap 'rm -f "$tmp" "$tmp.gz"' EXIT
+curl -fsSL --retry 3 -o "$tmp.gz" "https://download.db-ip.com/free/dbip-city-lite-$month.mmdb.gz" ||
+    curl -fsSL --retry 3 -o "$tmp.gz" "https://download.db-ip.com/free/dbip-city-lite-$(date -u -d 'last month' +%Y-%m).mmdb.gz"
+gunzip -c "$tmp.gz" > "$tmp"
+chmod 640 "$tmp"
+mv -f "$tmp" "$dir/dbip-city-lite.mmdb"
+echo "updated dbip-city-lite.mmdb ($month)"

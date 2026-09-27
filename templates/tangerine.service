@@ -1,0 +1,40 @@
+# Rendered by tangerine install.py
+[Unit]
+Description=tangerine archive server
+After=network.target local-fs.target
+RequiresMountsFor={{data_dirs}}
+
+[Service]
+ExecStart={{app_exec}}
+Environment=RUST_LOG=info
+User=tangerine
+Group=tangerine
+Restart=on-failure
+RestartSec=5
+MemoryMax={{memory_max}}
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+IPAddressAllow=localhost
+IPAddressDeny=any
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

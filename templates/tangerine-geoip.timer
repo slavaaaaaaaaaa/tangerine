@@ -1,0 +1,10 @@
+[Unit]
+Description=Monthly DB-IP refresh for tangerine-gate
+
+[Timer]
+OnCalendar=*-*-05 04:00
+RandomizedDelaySec=6h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
