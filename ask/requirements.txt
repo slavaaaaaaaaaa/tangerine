@@ -1,0 +1,5 @@
+# Installed into its own venv, /opt/tangerine-ask/venv, by install.py.
+anthropic>=1.15,<2
+openai>=3.33,<4
+PyYAML>=6,<7
+cryptography>=42

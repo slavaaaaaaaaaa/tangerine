@@ -20,7 +20,8 @@ app:
   listen: 127.0.0.1:8081
 
 gate:
-  session_days: 30
+  session_hours: 24      # how long a sign-in lasts
+  remember_days: 14      # ...when "Remember me" is ticked on the login page
   # Push a notification on every sign-in and on password-guessing bursts.
   # Any URL that accepts a POSTed text body works, e.g. https://ntfy.sh/<long-random-topic>
   notify_url: ""
@@ -34,6 +35,7 @@ gate:
   # login_page:
   #   title: tangerine
   #   button: Peel
+  #   remember: Remember me for 2 weeks
   #   footer: Unauthorized squeezing is strictly prohibited.
   #   goodbye: Peeled, eaten, gone. See you later.
   #   throttled: Easy there. The tangerine needs a minute.
@@ -43,6 +45,31 @@ gate:
   #   wrong_password:
   #     - Nope. That one's a clementine.
   #     - Hmm, that tastes like a grapefruit.
+
+# Ask an LLM about the document you're viewing. A document is everything under
+# one /A/B/C/ path of the collections in `indexes`. Each user brings their own
+# OpenAI or Anthropic API key; questions and the excerpts needed to answer them
+# are sent to that provider. install.py sets up its Python packages in
+# /opt/tangerine-ask/venv.
+ask:
+  enabled: true
+  indexes:                 # which of app.indexes to offer it on
+    - /srv/archive/collection-a/index.json
+  listen: 127.0.0.1:8083
+  # A second, unthrottled copy of the archive server that only tangerine-ask uses to
+  # read documents (~1 GB RAM). Not reachable through nginx.
+  crawl_listen: 127.0.0.1:8084
+  # Documents are indexed on their first question into /var/lib/tangerine-ask/index.db.
+  index_max_gb: 30
+  evict_at: 0.9            # past 90% of the cap, drop the least-asked documents
+  # Wording. All optional; the defaults are generic.
+  # noun: document         # "Ask about this document…"
+  # examples:              # sample questions shown in an empty chat
+  #   - What does section 3 say about X?
+  # system_prompt: |       # replaces the model's built-in instructions; {name} and
+  #   ...                  # {sections} are filled in
+  # prices:                # USD per million tokens, for models missing from the built-in list
+  #   some-model: {input: 1.0, output: 4.0}
 
 nginx:
   # Refuse requests for the bare IP or any other hostname. Turn off if this

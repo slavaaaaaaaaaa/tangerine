@@ -54,13 +54,15 @@ USERNAME_RE = re.compile(r"^[a-z0-9_.-]{1,32}$")
 GATE_DEFAULTS = {
     "listen": "127.0.0.1:8082",
     "passwords_file": "/etc/tangerine/passwords",
-    "session_days": 30,
+    "session_hours": 24,       # a normal sign-in
+    "remember_days": 14,       # with "Remember me" ticked
     "notify_url": "",
     "geoip": True,
     "throttle": {"per_ip": 10, "per_user": 20, "window_minutes": 15},
     "login_page": {
         "title": "tangerine",
         "button": "Peel",
+        "remember": "Remember me for 2 weeks",
         "footer": "Unauthorized squeezing is strictly prohibited.",
         "goodbye": "Peeled, eaten, gone. See you later.",
         "throttled": "Easy there. The tangerine needs a minute.",
@@ -299,12 +301,23 @@ CREATE TABLE IF NOT EXISTS sessions (
 """
 
 
+def session_seconds(remember):
+    return S["remember_days"] * 86400 if remember else S["session_hours"] * 3600
+
+
 def open_db():
     db = sqlite3.connect(os.path.join(STATE_DIR, "audit.db"), check_same_thread=False,
                          isolation_level=None, timeout=10)
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA journal_mode=WAL")
     db.executescript(SCHEMA)
+    if "remember" not in [r["name"] for r in db.execute("PRAGMA table_info(sessions)")]:
+        db.execute("ALTER TABLE sessions ADD COLUMN remember INTEGER NOT NULL DEFAULT 0")
+    if db.execute("PRAGMA user_version").fetchone()[0] < 1:
+        # Sessions from before "remember me" could last 30 days; cut them to a normal sign-in.
+        db.execute("UPDATE sessions SET expires = MIN(expires, created + ?) WHERE revoked = 0",
+                   (session_seconds(False),))
+        db.execute("PRAGMA user_version = 1")
     return db
 
 
@@ -351,14 +364,15 @@ class Audit:
             return self.db.execute("SELECT 1 FROM events WHERE event = 'login' AND user = ? AND ip = ? LIMIT 1",
                                    (user, ip)).fetchone() is not None
 
-    def new_session(self, user, ip, ua):
+    def new_session(self, user, ip, ua, remember):
         now = time.time()
         s = {"sid": secrets.token_urlsafe(16), "user": user, "created": now,
-             "expires": now + S["session_days"] * 86400, "last_seen": now, "ip": ip,
-             "geo": self.geo.lookup(ip), "ua": (ua or "")[:300], "requests": 0, "revoked": 0}
+             "expires": now + session_seconds(remember), "last_seen": now, "ip": ip,
+             "geo": self.geo.lookup(ip), "ua": (ua or "")[:300], "requests": 0, "revoked": 0,
+             "remember": int(remember)}
         with self.lock:
             self.db.execute("INSERT INTO sessions VALUES (:sid,:user,:created,:expires,:last_seen,"
-                            ":ip,:geo,:ua,:requests,:revoked)", s)
+                            ":ip,:geo,:ua,:requests,:revoked,:remember)", s)
             self.sessions[s["sid"]] = s
         return s
 
@@ -404,7 +418,7 @@ class Audit:
             self.dirty.clear()
             # Pick up revocations made from the CLI.
             for r in self.db.execute("SELECT sid FROM sessions WHERE revoked = 1 AND last_seen > ?",
-                                     (now - S["session_days"] * 86400,)):
+                                     (now - session_seconds(True),)):
                 self.sessions.pop(r["sid"], None)
             for sid in [k for k, s in self.sessions.items() if s["expires"] < now]:
                 del self.sessions[sid]
@@ -492,6 +506,8 @@ h1{font-size:22px;letter-spacing:.02em;margin:10px 0 2px;font-weight:650}
 form{text-align:left}
 label{display:block;font-size:13px;color:var(--muted);margin:12px 0 4px}
 input{width:100%;font:inherit;padding:10px 12px;border:1px solid var(--line);border-radius:10px;background:var(--field);color:var(--ink)}
+.check{display:flex;gap:8px;align-items:center;margin:14px 0 0;font-size:14px;color:var(--muted)}
+.check input{width:auto;margin:0;accent-color:var(--accent)}
 input:focus{outline:2px solid var(--accent);outline-offset:-1px;border-color:transparent}
 button{margin-top:20px;width:100%;font:inherit;font-weight:600;padding:10px;border:0;border-radius:10px;background:var(--accent);color:var(--accent-ink);cursor:pointer}
 button:hover{filter:brightness(1.05)}
@@ -529,10 +545,12 @@ def login_page(next_url="/", message="", kind="bad"):
 <input type="hidden" name="next" value="%s">
 <label for="u">Name</label><input id="u" name="user" autocomplete="username" autocapitalize="none" spellcheck="false" required autofocus>
 <label for="p">Password</label><input id="p" name="password" type="password" autocomplete="current-password" required>
+<label class="check"><input type="checkbox" name="remember" value="1">%s</label>
 <button type="submit">%s</button></form></div>
 <p class="foot">%s</p></main>"""
                 % (FRUIT, html.escape(lp["title"]), html.escape(random.choice(lp["taglines"] or [""])), msg,
-                   html.escape(next_url), html.escape(lp["button"]), html.escape(lp["footer"])))
+                   html.escape(next_url), html.escape(lp["remember"]), html.escape(lp["button"]),
+                   html.escape(lp["footer"])))
 
 
 def fmt_ts(ts):
@@ -547,6 +565,16 @@ def ago(ts):
         if d >= n:
             return "%d%s ago" % (d // n, unit)
     return "just now"
+
+
+def until(ts):
+    d = int(ts - time.time())
+    if d <= 0:
+        return "expired"
+    for unit, n in (("d", 86400), ("h", 3600), ("m", 60)):
+        if d >= n:
+            return "in %d%s" % (d // n, unit)
+    return "in <1m"
 
 
 def short_ua(ua):
@@ -721,13 +749,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                            self.gate.fail_ip.limit, name, ip, where or "unknown location"))
             return self.send(401, login_page(nxt, random.choice(S["login_page"]["wrong_password"] or ["Nope."])))
         new_ip = not audit.seen_before(name, ip)
-        s = audit.new_session(name, ip, ua)
-        where = audit.event("login", name, ip, ua, "new_ip" if new_ip else "")
+        remember = f.get("remember") == "1"
+        s = audit.new_session(name, ip, ua, remember)
+        where = audit.event("login", name, ip, ua, " ".join(
+            x for x in ("new_ip" if new_ip else "", "remember" if remember else "") if x))
         notify("tangerine: %s signed in%s" % (name, " from a new IP" if new_ip else ""),
                "%s from %s (%s)\n%s" % (name, ip, where or "unknown location", short_ua(ua)))
         token = sign(self.gate.secret, {"u": name, "sid": s["sid"], "g": password_gen(u["hash"]),
                                         "exp": int(s["expires"])})
-        self.redirect(nxt, self.cookie(token, S["session_days"] * 86400))
+        self.redirect(nxt, self.cookie(token, session_seconds(remember)))
 
     def logout(self):
         s, _ = self.session()
@@ -769,11 +799,13 @@ def admin_page(gate, only_user=None):
     rows = []
     for s in live:
         rows.append("<tr><td><a href='?user=%s'>%s</a></td><td title='%s'>%s</td><td>%s</td><td>%s</td>"
-                    "<td title='%s'>%s</td><td>%d</td><td>%s</td><td><form method=post action='/_gate/admin/revoke'>"
+                    "<td title='%s'>%s</td><td>%d</td><td>%s</td><td title='%s'>%s%s</td>"
+                    "<td><form method=post action='/_gate/admin/revoke'>"
                     "<input type=hidden name=sid value='%s'><button class=mini>kick</button></form></td></tr>" % (
                         e(urllib.parse.quote(s["user"])), e(s["user"]), e(fmt_ts(s["last_seen"])),
                         e(ago(s["last_seen"])), e(s["ip"] or ""), e(s["geo"] or ""), e(s["ua"] or ""),
-                        e(short_ua(s["ua"])), s["requests"], e(fmt_ts(s["created"])), e(s["sid"])))
+                        e(short_ua(s["ua"])), s["requests"], e(fmt_ts(s["created"])), e(fmt_ts(s["expires"])),
+                        e(until(s["expires"])), " (remembered)" if s.get("remember") else "", e(s["sid"])))
     events = []
     for r in audit.recent_events(300, only_user):
         cls = "bad" if r["event"] in ("login_failed", "login_throttled") else ""
@@ -787,7 +819,7 @@ def admin_page(gate, only_user=None):
     body = """<main class="wrap" style="text-align:left"><h1>%s %s &middot; door log</h1>
 <p class="tag">%d users &middot; %d live sessions &middot; times in %s%s &middot; <a href="/">back</a></p>
 <h2>Who's here</h2><div class=scroll><table><tr><th>user</th><th>last seen</th><th>ip</th><th>where</th>
-<th>browser</th><th>requests</th><th>signed in</th><th></th></tr>%s</table></div>
+<th>browser</th><th>requests</th><th>signed in</th><th>signs out</th><th></th></tr>%s</table></div>
 <h2>Door log</h2><div class=scroll><table><tr><th>time</th><th>event</th><th>user</th><th>ip</th><th>host</th>
 <th>where</th><th>browser</th><th>detail</th></tr>%s</table></div>
 <p class="foot"><a href="https://db-ip.com">IP Geolocation by DB-IP</a></p></main>
@@ -796,12 +828,15 @@ table{border-collapse:collapse;width:100%%;font-size:13px}th,td{padding:6px 10px
 th{color:var(--muted);font-weight:500}tr.bad td{color:var(--bad)}.fruit{width:28px;height:28px;vertical-align:-6px}
 a{color:var(--accent)}button.mini{margin:0;width:auto;padding:2px 10px;font-size:12px}</style>""" % (
         FRUIT, e(S["login_page"]["title"]), len(users), len(live), e(time.strftime("%Z")), filt,
-        "".join(rows) or "<tr><td colspan=8>nobody</td></tr>",
+        "".join(rows) or "<tr><td colspan=9>nobody</td></tr>",
         "".join(events) or "<tr><td colspan=8>nothing yet</td></tr>")
     return page(S["login_page"]["title"] + " door log", body, width=1200)
 
 
 def serve():
+    if "session_days" in (load_config().get("gate") or {}):
+        log("gate.session_days is no longer used (sign-ins last session_hours, or remember_days "
+            "with \"Remember me\"); remove it from config.yaml")
     Handler.gate = Gate()
     host, _, port = S["listen"].rpartition(":")
     srv = http.server.ThreadingHTTPServer((host.strip("[]"), int(port)), Handler)
@@ -900,9 +935,9 @@ def main():
     elif a.cmd == "sessions":
         for r in db.execute("SELECT * FROM sessions WHERE revoked = 0 AND expires > ? ORDER BY last_seen DESC",
                             (time.time(),)):
-            print("%s  %-12s last seen %-10s %-39s %-30s %6d reqs  %s" % (
-                r["sid"], r["user"], ago(r["last_seen"]), r["ip"], r["geo"] or "", r["requests"],
-                short_ua(r["ua"])))
+            print("%s  %-12s last seen %-10s signs out %-8s %-39s %-30s %6d reqs  %s" % (
+                r["sid"], r["user"], ago(r["last_seen"]), until(r["expires"]), r["ip"], r["geo"] or "",
+                r["requests"], short_ua(r["ua"])))
     elif a.cmd == "revoke":
         if a.user:
             n = db.execute("UPDATE sessions SET revoked = 1 WHERE user = ? AND revoked = 0", (a.user,)).rowcount

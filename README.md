@@ -19,6 +19,7 @@ Both backends listen on localhost only, so nginx is the only way in.
 | `install.py` | Renders `templates/` from your config and installs everything (idempotent) |
 | `gate/tangerine-gate` | The login gate and its admin CLI (Python + PyYAML) |
 | `gate/tangerine-geoip-update` | Monthly IP-location database refresh |
+| `ask/` | `tangerine-ask` (LLM questions about a document) and the overlay it adds to document pages |
 | `templates/` | nginx, systemd and fail2ban files with `{{placeholders}}` |
 
 ## Setup
@@ -48,6 +49,8 @@ sudo tangerine-gate passwd bob --random    # prints a generated password to hand
 
 Removing someone from `users:` signs them out within seconds. So does changing their password.
 
+**How long sign-ins last:** a day, or two weeks if "Remember me" is ticked on the login page (`gate.session_hours`, `gate.remember_days`). Both count from the moment of signing in.
+
 **See who's been in:**
 
 ```sh
@@ -60,9 +63,11 @@ sudo tangerine-gate revoke --user bob      # kick someone
 Admins (`admin: true`) can also see and kick sessions at `https://<domain>/_gate/admin`.
 Set `gate.notify_url` (for example an ntfy.sh topic) to get a push notification on every sign-in and whenever someone starts guessing passwords.
 
+**Ask about a document** (`ask:` in the config): an "Ask" button on the pages of the collections in `ask.indexes` opens a chat about the document being viewed (everything under one `/A/B/C/` path). Each person picks OpenAI or Anthropic, pastes their own API key and chooses a model; the picker shows each model's list price per million tokens. They pay their provider for what they ask. The first question about a document reads all of its pages into a search index, which takes about a minute. It reads from `tangerine-crawl`, a second copy of the archive server without rate limits that only tangerine-ask can use (localhost only, about 1 GB of RAM). The model then searches and reads pages and cites them, and the figures of cited pages show under the answer. Follow-up questions carry the conversation so far. Conversations are kept only in each person's browser, never on the server. Questions and the excerpts needed to answer them go to the chosen provider; the panel says so before first use. The index is capped at `ask.index_max_gb` (30 GB). Past 90% of that, the least-asked documents are dropped and re-read the next time someone asks about them. The panel's wording, its example questions and the model's instructions can be set with `ask.noun`, `ask.examples` and `ask.system_prompt`.
+
 **Change anything else** (domain, login page text, limits): edit the config, then `sudo ./install.py`.
 
-**Logs:** `journalctl -u tangerine-gate` / `-u tangerine`, and `/var/log/nginx/tangerine.access.log`, which tags every request with the username.
+**Logs:** `journalctl -u tangerine-gate` / `-u tangerine` / `-u tangerine-ask` / `-u tangerine-crawl`, and `/var/log/nginx/tangerine.access.log`, which tags every request with the username.
 
 ## Files on the server
 
@@ -71,6 +76,9 @@ Set `gate.notify_url` (for example an ntfy.sh topic) to get a push notification 
 | `/etc/tangerine/config.yaml` | Installed config (read by the gate) |
 | `/etc/tangerine/passwords` | scrypt password hashes, written by `tangerine-gate passwd` |
 | `/var/lib/tangerine-gate/` | `audit.db` (door log), session signing key, GeoIP database |
+| `/etc/tangerine/ask.yaml` | tangerine-ask's own settings, rendered from `ask:` |
+| `/var/lib/tangerine-ask/` | `index.db` (search index, capped by `ask.index_max_gb`), `ask.db` (each person's provider, model and encrypted API key), `keys.secret` (the key that encrypts them) |
+| `/opt/tangerine-ask/venv` | Python environment with the OpenAI and Anthropic SDKs |
 
 `config.yaml` holds no secrets, since passwords live on the server. It's git-ignored because it's machine-specific; commit it if you want it tracked.
 

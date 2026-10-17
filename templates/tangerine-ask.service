@@ -1,0 +1,39 @@
+# Rendered by tangerine install.py
+[Unit]
+Description=tangerine ask: LLM questions about the document being viewed
+After=network-online.target tangerine.service
+Wants=network-online.target
+RequiresMountsFor={{ask_data_dirs}}
+
+[Service]
+ExecStart=/opt/tangerine-ask/venv/bin/python /usr/local/bin/tangerine-ask serve
+User=tangerine-ask
+Group=tangerine-ask
+StateDirectory=tangerine-ask
+StateDirectoryMode=0750
+Restart=on-failure
+RestartSec=5
+MemoryMax=2G
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,40 @@
+# Rendered by tangerine install.py
+[Unit]
+Description=tangerine-crawl: unthrottled copy of the archive server for tangerine-ask (localhost only, not proxied)
+After=network.target local-fs.target
+RequiresMountsFor={{ask_data_dirs}}
+
+[Service]
+ExecStart={{crawl_exec}}
+Environment=RUST_LOG=info
+User=tangerine
+Group=tangerine
+Restart=on-failure
+RestartSec=5
+MemoryMax={{crawl_memory_max}}
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+IPAddressAllow=localhost
+IPAddressDeny=any
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

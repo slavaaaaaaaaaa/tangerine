@@ -1,0 +1,1077 @@
+#!/usr/bin/env python3
+"""tangerine-ask: ask an LLM about the document you're reading in the archive.
+
+A document is everything under one /A/B/C/ path of the collections listed in
+`indexes:`. The first question about a document crawls it from the archive
+server (over localhost) into a SQLite full-text index. The model then answers
+with tools that search and read that one document's pages, citing them as
+[p:ID]. Pages are stored once by content hash, so near-identical documents
+mostly share storage. When the index passes evict_at x index_max_gb, the
+least-asked documents are dropped (they re-index on their next question).
+
+Each user brings their own OpenAI or Anthropic API key, stored encrypted here.
+nginx sends only signed-in requests, with the user in X-Tangerine-User.
+
+    tangerine-ask serve
+"""
+import hashlib
+import html
+import html.parser
+import http.server
+import json
+import os
+import queue
+import re
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+
+import yaml
+
+CONFIG_FILE = os.environ.get("TANGERINE_ASK_CONFIG", "/etc/tangerine/ask.yaml")
+STATE_DIR = os.environ.get("TANGERINE_ASK_STATE", "/var/lib/tangerine-ask")
+SHARE_DIR = os.environ.get("TANGERINE_ASK_SHARE", "/usr/local/share/tangerine-ask")
+
+DEFAULTS = {
+    "listen": "127.0.0.1:8083",
+    "crawl_url": "http://127.0.0.1:8084",   # tangerine-crawl: the archive server, unthrottled, for us only
+    "indexes": [],
+    "index_max_gb": 30,
+    "evict_at": 0.9,
+    # Wording for the panel and the model; the defaults are deliberately generic.
+    "noun": "document",
+    "examples": [],
+    "system_prompt": None,
+}
+
+MAX_PAGES = 60000          # per document; the biggest seen so far have ~16k
+CRAWL_THREADS = 8
+MAX_TOOL_ROUNDS = 12
+HISTORY_TURNS = 8          # earlier question/answer pairs sent with each question
+HISTORY_CHARS = 12000      # per earlier message; long answers are cut to this
+READ_PAGE_CHARS = 24000
+PROVIDERS = ("anthropic", "openai")
+
+S = dict(DEFAULTS)
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+# ---------------------------------------------------------------- documents
+
+def canonical_doc_path(path):
+    """'/A/B/C%20D/section/page/' -> '/A/B/C%20D/' (re-encoded the way the archive server does)"""
+    segs = [s for s in (path or "").split("?")[0].split("/") if s]
+    if len(segs) < 3 or segs[0].startswith("_") or segs[0] == "bundle":
+        return None
+    return "/" + "/".join(urllib.parse.quote(urllib.parse.unquote(s), safe="") for s in segs[:3]) + "/"
+
+
+def doc_name(path):
+    return " · ".join(urllib.parse.unquote(s) for s in path.strip("/").split("/"))
+
+
+class Catalog:
+    """uriPaths of every document in the configured index.json files."""
+
+    def __init__(self, index_paths):
+        self.paths = set()
+        for p in index_paths:
+            with open(p, "rb") as f:
+                data = f.read()
+            for m in re.finditer(rb'"uriPath"\s*:\s*"((?:[^"\\]|\\.)*)"', data):
+                d = canonical_doc_path(json.loads(b'"' + m.group(1) + b'"'))
+                if d:
+                    self.paths.add(d)
+            del data
+        log("catalog: %d documents" % len(self.paths))
+
+    def __contains__(self, path):
+        return path in self.paths
+
+
+# ---------------------------------------------------------------- page parsing
+
+BLOCK = {"p", "div", "br", "li", "tr", "h1", "h2", "h3", "h4", "h5", "h6", "ol", "ul", "table",
+         "dt", "dd", "section", "pre", "blockquote", "hr"}
+
+
+class PageParser(html.parser.HTMLParser):
+    """The .main part of an archive page -> text with [figure N] markers, figures, links."""
+
+    def __init__(self, page_url):
+        super().__init__(convert_charrefs=True)
+        self.page_url = page_url
+        self.out = []
+        self.figures = []
+        self.links = []
+        self.link_chars = 0
+        self.in_link = 0
+        self.skip = 0
+
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        if tag in ("script", "style"):
+            self.skip += 1
+        elif tag in BLOCK:
+            self.out.append("\n")
+            if tag == "li":
+                self.out.append("- ")
+        elif tag in ("td", "th"):
+            self.out.append(" | ")
+        if tag == "a":
+            self.in_link += 1
+            if a.get("href"):
+                self.links.append(a["href"])
+        elif tag == "img" and "folder-icon" not in (a.get("class") or "") and a.get("src"):
+            self.figures.append(urllib.parse.urljoin(self.page_url, a["src"]))
+            self.out.append(" [figure %d] " % len(self.figures))
+
+    def handle_endtag(self, tag):
+        if tag in ("script", "style"):
+            self.skip = max(0, self.skip - 1)
+        elif tag == "a":
+            self.in_link = max(0, self.in_link - 1)
+        elif tag in BLOCK:
+            self.out.append("\n")
+
+    def handle_data(self, data):
+        if self.skip:
+            return
+        self.out.append(data)
+        if self.in_link:
+            self.link_chars += len(data.strip())
+
+    def text(self):
+        t = "".join(self.out)
+        t = re.sub(r"[ \t\r\f\v\xa0]+", " ", t)
+        t = re.sub(r" *\n[ \n]*", "\n", t)
+        return t.strip()
+
+
+MAIN_RE = re.compile(r'<div class="main">(.*)</div><div class="theme-colors footer"', re.S)
+CRUMB_RE = re.compile(r'class="breadcrumb-part"[^>]*>([^<]*)<')
+H1_RE = re.compile(r"<h1>(.*?)</h1>", re.S)
+
+
+def parse_page(page_url, raw):
+    m = MAIN_RE.search(raw)
+    main = m.group(1) if m else ""
+    p = PageParser(page_url)
+    p.feed(main)
+    p.close()
+    body = p.text()
+    h1 = H1_RE.search(main)
+    title = html.unescape(re.sub(r"<[^>]+>", "", h1.group(1))).strip() if h1 else ""
+    crumbs = [html.unescape(c).strip() for c in CRUMB_RE.findall(raw)][4:]   # after Home > make > year > model
+    content = body[len(title):].strip() if body.startswith(title) else body
+    # Folder pages are lists of links; only leaves with real text get indexed.
+    is_folder = len(content) - p.link_chars < 40 or "li-folder" in main
+    other = "other-warning" in main or any(x in page_url for x in ("/External%20Pages/", "/Other%20Variant/"))
+    return {"title": title or (crumbs[-1] if crumbs else ""), "crumbs": crumbs, "body": body,
+            "figures": p.figures, "links": p.links, "is_folder": is_folder, "other": other}
+
+
+# ---------------------------------------------------------------- index database
+
+INDEX_SCHEMA = """
+CREATE TABLE IF NOT EXISTS docs (
+    id INTEGER PRIMARY KEY, path TEXT UNIQUE NOT NULL, name TEXT NOT NULL,
+    status TEXT NOT NULL,            -- queued | indexing | ready | failed | evicted
+    error TEXT, pages INTEGER NOT NULL DEFAULT 0, sections TEXT,
+    questions INTEGER NOT NULL DEFAULT 0, last_asked REAL, indexed_at REAL);
+CREATE TABLE IF NOT EXISTS pages (
+    id INTEGER PRIMARY KEY, hash BLOB UNIQUE NOT NULL, title TEXT NOT NULL,
+    other INTEGER NOT NULL, figures TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS doc_pages (
+    doc INTEGER NOT NULL, path TEXT NOT NULL, page INTEGER NOT NULL, PRIMARY KEY (doc, path));
+CREATE INDEX IF NOT EXISTS doc_pages_page ON doc_pages(page);
+-- rowid = pages.id; `docs` holds a "d<id>" token for each document that has the page.
+CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(docs, title, crumbs, body, tokenize='porter unicode61');
+"""
+
+ASK_SCHEMA = """
+CREATE TABLE IF NOT EXISTS users (
+    name TEXT PRIMARY KEY, provider TEXT, model TEXT, key_enc TEXT, key_hint TEXT, privacy_ack REAL);
+-- Conversations live in each user's browser now; earlier versions kept them here.
+DROP TABLE IF EXISTS messages;
+DROP TABLE IF EXISTS chats;
+"""
+
+_local = threading.local()
+
+
+def connect(name, schema):
+    import sqlite3
+    db = sqlite3.connect(os.path.join(STATE_DIR, name), isolation_level=None, timeout=60,
+                         check_same_thread=False)
+    db.row_factory = sqlite3.Row
+    db.execute("PRAGMA journal_mode=WAL")
+    db.execute("PRAGMA synchronous=NORMAL")
+    db.executescript(schema)
+    return db
+
+
+INDEX_LAYOUT = 2   # bump when INDEX_SCHEMA changes incompatibly
+
+
+def upgrade_index_layout():
+    """The index is only a cache of the archive, so an older layout is simply
+    dropped and rebuilt: documents re-index on their next question."""
+    db = connect("index.db", "")
+    if db.execute("PRAGMA user_version").fetchone()[0] < INDEX_LAYOUT:
+        # Full-text tables first: dropping one also drops its shadow tables.
+        tables = [r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type = 'table' "
+                                           "AND name NOT LIKE 'sqlite_%' ORDER BY sql NOT LIKE 'CREATE VIRTUAL%'")]
+        if tables:
+            log("index: older layout, starting a fresh index")
+        for t in tables:
+            db.execute('DROP TABLE IF EXISTS "%s"' % t.replace('"', '""'))
+        db.execute("PRAGMA user_version = %d" % INDEX_LAYOUT)
+        db.execute("VACUUM")
+    db.close()
+
+
+def idx():
+    if not hasattr(_local, "idx"):
+        _local.idx = connect("index.db", INDEX_SCHEMA)
+    return _local.idx
+
+
+def adb():
+    if not hasattr(_local, "adb"):
+        _local.adb = connect("ask.db", ASK_SCHEMA)
+    return _local.adb
+
+
+def index_used_bytes(db):
+    """Bytes in use, not file size: pages freed by eviction are reused before the file grows."""
+    page_size = db.execute("PRAGMA page_size").fetchone()[0]
+    count = db.execute("PRAGMA page_count").fetchone()[0]
+    free = db.execute("PRAGMA freelist_count").fetchone()[0]
+    return (count - free) * page_size
+
+
+def remove_doc_pages(db, did):
+    """Drop a document's pages from the index; pages other documents also have stay."""
+    tok = "d%d" % did
+    db.execute("BEGIN")
+    for (pid,) in db.execute("SELECT DISTINCT page FROM doc_pages WHERE doc = ?", (did,)).fetchall():
+        row = db.execute("SELECT docs FROM fts WHERE rowid = ?", (pid,)).fetchone()
+        rest = [t for t in (row[0] if row else "").split() if t != tok]
+        if rest:
+            db.execute("UPDATE fts SET docs = ? WHERE rowid = ?", (" ".join(rest), pid))
+        else:
+            db.execute("DELETE FROM fts WHERE rowid = ?", (pid,))
+            db.execute("DELETE FROM pages WHERE id = ?", (pid,))
+    db.execute("DELETE FROM doc_pages WHERE doc = ?", (did,))
+    db.execute("COMMIT")
+
+
+def make_room(db, keep_did):
+    """Evict least-asked documents until the index is under evict_at x index_max_gb."""
+    limit = S["index_max_gb"] * 1e9 * S["evict_at"]
+    while index_used_bytes(db) > limit:
+        victim = db.execute("SELECT id, path, questions FROM docs WHERE status = 'ready' AND id != ? "
+                            "ORDER BY questions, COALESCE(last_asked, 0), indexed_at LIMIT 1",
+                            (keep_did,)).fetchone()
+        if not victim:
+            return
+        log("index: %.1f GB in use, evicting %s (%d questions)"
+            % (index_used_bytes(db) / 1e9, victim["path"], victim["questions"]))
+        remove_doc_pages(db, victim["id"])
+        db.execute("UPDATE docs SET status = 'evicted', pages = 0, sections = NULL WHERE id = ?",
+                   (victim["id"],))
+
+
+# ---------------------------------------------------------------- crawling
+
+class Fetcher:
+    """GETs from tangerine-crawl, a copy of the archive server that only we use.
+    The public one rate-limits per client; this one has no limits, so a whole
+    document takes about a minute instead of twenty."""
+
+    def get(self, url):
+        for attempt in range(4):
+            req = urllib.request.Request(url, headers={"User-Agent": "tangerine-ask"})
+            try:
+                with urllib.request.urlopen(req, timeout=60) as r:
+                    return r.read().decode("utf-8", "replace")
+            except urllib.error.HTTPError as e:
+                if e.code == 404:
+                    return None
+                if attempt == 3:
+                    raise
+            except (urllib.error.URLError, TimeoutError):
+                if attempt == 3:
+                    raise
+            time.sleep(1 + attempt)
+
+
+def crawl_and_index(did, dpath, progress):
+    """Walk every page under the document and index the leaves."""
+    db = idx()
+    app = S["crawl_url"].rstrip("/")
+    fetcher = Fetcher()
+    tok = "d%d" % did
+    seen, indexed = {""}, 0
+    pending = []
+
+    errors = [0]
+
+    def fetch(rel):
+        try:
+            raw = fetcher.get(app + dpath + rel)
+            # Parse against the path only: figure URLs must stay relative to the public site,
+            # not point at the crawler's localhost server.
+            return rel, (parse_page(dpath + rel, raw) if raw else None)
+        except Exception as e:
+            errors[0] += 1
+            log("index: %s%s: %r" % (dpath, rel, e))
+            return rel, None
+
+    def flush():
+        nonlocal indexed
+        db.execute("BEGIN")
+        for rel, pg in pending:
+            figures = json.dumps(pg["figures"])
+            h = hashlib.sha256((pg["title"] + "\0" + pg["body"] + "\0" + figures).encode()).digest()
+            row = db.execute("SELECT id FROM pages WHERE hash = ?", (h,)).fetchone()
+            if row:
+                pid = row[0]
+                cur = db.execute("SELECT docs FROM fts WHERE rowid = ?", (pid,)).fetchone()
+                toks = (cur[0] if cur else "").split()
+                if tok not in toks:
+                    db.execute("UPDATE fts SET docs = ? WHERE rowid = ?", (" ".join(toks + [tok]), pid))
+            else:
+                pid = db.execute("INSERT INTO pages (hash, title, other, figures) VALUES (?,?,?,?)",
+                                 (h, pg["title"], int(pg["other"]), figures)).lastrowid
+                db.execute("INSERT INTO fts (rowid, docs, title, crumbs, body) VALUES (?,?,?,?,?)",
+                           (pid, tok, pg["title"], " > ".join(pg["crumbs"]), pg["body"]))
+            db.execute("INSERT OR IGNORE INTO doc_pages (doc, path, page) VALUES (?,?,?)", (did, rel, pid))
+            indexed += 1
+        db.execute("COMMIT")
+        pending.clear()
+        make_room(db, did)
+
+    # Each section has a "(Single Page)" twin listing every page under it, which
+    # saves fetching all the folder pages of the split tree.
+    root = fetch("")[1]
+    if not root:
+        raise RuntimeError("the archive server has no page for this document")
+    fetched = 1
+    sections = [l for l in root["links"] if not l.startswith(("/", "#", "..")) and "%28Single%20Page%29" not in l]
+    frontier = []
+    for sec in sections:
+        twin = sec.rstrip("/") + "%20%28Single%20Page%29/"
+        raw = fetcher.get(app + dpath + twin) if twin in root["links"] else None
+        fetched += 1
+        hrefs = re.findall(r'<a href="([^"#]+)"', MAIN_RE.search(raw).group(1)) if raw and MAIN_RE.search(raw) else []
+        hrefs = [h for h in hrefs if not h.startswith(("/", ".."))]
+        for child in ([sec + h for h in hrefs] if hrefs else [sec]):
+            if child not in seen:
+                seen.add(child)
+                frontier.append(child)
+
+    with ThreadPoolExecutor(CRAWL_THREADS) as pool:
+        while frontier and fetched < MAX_PAGES:
+            batch, frontier = frontier[:500], frontier[500:]
+            for rel, pg in pool.map(fetch, batch):
+                fetched += 1
+                if not pg:
+                    continue
+                if not pg["is_folder"]:
+                    pending.append((rel, pg))
+                for href in pg["links"]:
+                    url = urllib.parse.urljoin(dpath + rel, href).split("#")[0].split("?")[0]
+                    if not url.startswith(dpath):
+                        continue
+                    child = url[len(dpath):]
+                    if child not in seen and "%28Single%20Page%29" not in child.split("/")[0]:
+                        seen.add(child)
+                        frontier.append(child)
+            flush()
+            progress(fetched, len(seen), indexed)
+            if errors[0] > 50 and errors[0] > fetched * 0.02:
+                raise RuntimeError("too many pages failed to load from the archive server")
+    # Pages shared with already-indexed documents were rewritten to add this one.
+    # Force a few bounded merges so the index drops the old copies (a near-duplicate document
+    # then costs ~10 MB instead of ~20).
+    for _ in range(3):
+        before = db.total_changes
+        db.execute("INSERT INTO fts (fts, rank) VALUES ('merge', -2000)")
+        if db.total_changes - before < 2:
+            break
+    names = [urllib.parse.unquote(s.strip("/")) for s in sections]
+    return indexed, names
+
+
+class Indexer:
+    def __init__(self):
+        self.q = queue.Queue()
+        self.progress = {}      # document id -> (fetched, discovered, indexed)
+        db = idx()
+        # Early versions stored figure URLs with the crawler's http://127.0.0.1:port in front,
+        # which browsers can't (and shouldn't) load. Keep just the path.
+        n = 0
+        db.execute("BEGIN")
+        for pid, figures in db.execute("SELECT id, figures FROM pages WHERE figures LIKE '%://%'").fetchall():
+            fixed = json.dumps([re.sub(r"^https?://[^/]+", "", f) for f in json.loads(figures)])
+            n += db.execute("UPDATE pages SET figures = ? WHERE id = ?", (fixed, pid)).rowcount
+        db.execute("COMMIT")
+        if n:
+            log("index: made figure links relative on %d pages" % n)
+        # A restart mid-crawl leaves partial data behind; redo those.
+        for r in db.execute("SELECT id, path FROM docs WHERE status IN ('queued', 'indexing')").fetchall():
+            remove_doc_pages(db, r["id"])
+            db.execute("UPDATE docs SET status = 'queued' WHERE id = ?", (r["id"],))
+            self.q.put((r["id"], r["path"]))
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def request(self, dpath):
+        db = idx()
+        db.execute("INSERT OR IGNORE INTO docs (path, name, status) VALUES (?,?,'evicted')",
+                   (dpath, doc_name(dpath)))
+        r = db.execute("UPDATE docs SET status = 'queued', error = NULL WHERE path = ? "
+                       "AND status IN ('failed', 'evicted') RETURNING id", (dpath,)).fetchone()
+        if r:
+            self.q.put((r[0], dpath))
+
+    def _loop(self):
+        while True:
+            did, dpath = self.q.get()
+            db = idx()
+            db.execute("UPDATE docs SET status = 'indexing' WHERE id = ?", (did,))
+            t = time.time()
+            log("index: crawling %s" % dpath)
+            try:
+                n, sections = crawl_and_index(did, dpath, lambda *p: self.progress.__setitem__(did, p))
+                if not n:
+                    raise RuntimeError("no pages found")
+                db.execute("UPDATE docs SET status = 'ready', pages = ?, sections = ?, indexed_at = ? "
+                           "WHERE id = ?", (n, json.dumps(sections), time.time(), did))
+                log("index: %s ready, %d pages in %ds, index %.2f GB"
+                    % (dpath, n, time.time() - t, index_used_bytes(db) / 1e9))
+            except Exception as e:
+                log("index: %s failed: %r" % (dpath, e))
+                try:
+                    if db.in_transaction:
+                        db.execute("ROLLBACK")
+                    remove_doc_pages(db, did)
+                finally:
+                    db.execute("UPDATE docs SET status = 'failed', error = ? WHERE id = ?",
+                               (str(e)[:300], did))
+            self.progress.pop(did, None)
+
+
+# ---------------------------------------------------------------- tools the model can call
+
+def fts_query(text):
+    terms = []
+    for t in re.findall(r"\w[\w.\-/]*", text.lower()):
+        t = t.strip(".-/")
+        if t and t not in terms:
+            terms.append(t)
+    return " OR ".join('"%s"' % t for t in terms[:24])
+
+
+class Doc:
+    """One document's view of the index."""
+
+    def __init__(self, doc):
+        self.d = doc
+        self.did = doc["id"]
+        self.db = idx()
+        self.seen = {}   # page id -> metadata, for citations
+
+    def _remember(self, pid):
+        if pid not in self.seen:
+            r = self.db.execute("SELECT p.title, p.figures, p.other, dp.path FROM pages p JOIN doc_pages dp "
+                                "ON dp.page = p.id AND dp.doc = ? WHERE p.id = ? LIMIT 1",
+                                (self.did, pid)).fetchone()
+            if not r:
+                return None
+            crumbs = self.db.execute("SELECT crumbs FROM fts WHERE rowid = ?", (pid,)).fetchone()[0]
+            self.seen[pid] = {"id": pid, "title": r["title"], "crumbs": crumbs, "other": bool(r["other"]),
+                              "url": self.d["path"] + r["path"], "figures": json.loads(r["figures"])}
+        return self.seen[pid]
+
+    def search(self, query, include_other_variants=False):
+        q = fts_query(query)
+        if not q:
+            return "Empty query."
+        rows = self.db.execute(
+            "SELECT f.rowid AS id, f.title, f.crumbs, p.other, "
+            "snippet(fts, 3, '«', '»', ' … ', 28) AS snip, bm25(fts, 0.0, 8.0, 3.0, 1.0) AS rank "
+            "FROM fts f JOIN pages p ON p.id = f.rowid WHERE fts MATCH ? ORDER BY rank LIMIT 40",
+            ('docs:"d%d" AND (%s)' % (self.did, q),)).fetchall()
+        own = [r for r in rows if not r["other"]]
+        others = [r for r in rows if r["other"]]
+        picked = (own[:8] + others[:4]) if include_other_variants else (own[:8] or others[:4])
+        if not picked:
+            return "No pages matched %r. Try other words, or list_sections to browse." % query
+        out = []
+        for r in picked:
+            self._remember(r["id"])
+            out.append("[p:%d] %s%s\n  in: %s\n  %s" % (r["id"], r["title"], "  (OTHER VARIANT)" if r["other"] else "",
+                                                       r["crumbs"], r["snip"].replace("\n", " ")))
+        return "\n".join(out)
+
+    def read_page(self, page_id):
+        try:
+            pid = int(str(page_id).strip("[]p: "))
+        except ValueError:
+            return "Give a numeric page id from search results."
+        meta = self._remember(pid)
+        if not meta:
+            return "No page %s in this document." % page_id
+        body = self.db.execute("SELECT body FROM fts WHERE rowid = ?", (pid,)).fetchone()[0]
+        if len(body) > READ_PAGE_CHARS:
+            body = body[:READ_PAGE_CHARS] + "\n[... page truncated ...]"
+        note = ("NOTE: this page was written for a DIFFERENT variant than the user's.\n" if meta["other"] else "")
+        return "[p:%d] %s\nin: %s\n%s\n%s" % (pid, meta["title"], meta["crumbs"], note, body)
+
+    def list_sections(self, path=None):
+        want = [str(s) for s in (path or []) if s]
+        children = {}
+        for r in self.db.execute("SELECT path, page FROM doc_pages WHERE doc = ?", (self.did,)):
+            segs = [urllib.parse.unquote(x) for x in r["path"].strip("/").split("/")]
+            if len(segs) <= len(want) or segs[:len(want)] != want:
+                continue
+            c = children.setdefault(segs[len(want)], {"pages": 0, "page": None})
+            c["pages"] += 1
+            if len(segs) == len(want) + 1:
+                c["page"] = r["page"]
+        if not children:
+            return "Nothing under %s." % (" > ".join(path or []) or "the top level")
+        lines = []
+        for name in sorted(children)[:300]:
+            c = children[name]
+            if c["page"] and c["pages"] == 1:
+                self._remember(c["page"])
+                lines.append("- [p:%d] %s" % (c["page"], name))
+            else:
+                lines.append("- %s/  (%d pages)" % (name, c["pages"]))
+        return "\n".join(lines)
+
+
+TOOLS = [
+    {"name": "search",
+     "description": "Full-text search of this document. Returns page ids, titles, where they sit in "
+                    "the document, and a snippet. Use concrete terms: names of parts, codes, symptoms, "
+                    "names of specifications.",
+     "schema": {"type": "object", "properties": {
+         "query": {"type": "string"},
+         "include_other_variants": {"type": "boolean",
+                                    "description": "Also return pages written for other variants."}},
+         "required": ["query"]}},
+    {"name": "read_page",
+     "description": "Read one page in full. Do this before relying on a page; snippets are partial.",
+     "schema": {"type": "object", "properties": {"page_id": {"type": "integer"}}, "required": ["page_id"]}},
+    {"name": "list_sections",
+     "description": "Browse the document's table of contents. With no path, lists the top level; pass the "
+                    "folder names from previous results to go deeper.",
+     "schema": {"type": "object", "properties": {
+         "path": {"type": "array", "items": {"type": "string"},
+                  "description": 'e.g. ["Section", "Subsection"]'}}}},
+]
+
+
+def run_tool(doc, name, args):
+    try:
+        if name == "search":
+            return doc.search(args.get("query", ""), bool(args.get("include_other_variants")))
+        if name == "read_page":
+            return doc.read_page(args.get("page_id"))
+        if name == "list_sections":
+            return doc.list_sections(args.get("path"))
+        return "Unknown tool %s." % name
+    except Exception as e:
+        log("tool %s failed: %r" % (name, e))
+        return "Tool error: %s" % e
+
+
+def tool_status(name, args):
+    if name == "search":
+        return "Searching: %s" % args.get("query", "")
+    if name == "read_page":
+        return "Reading page %s" % args.get("page_id")
+    return "Browsing: %s" % (" > ".join(args.get("path") or []) or "contents")
+
+
+# Default instructions for the model. `system_prompt:` in the config replaces them;
+# {name} and {sections} are filled in either way.
+SYSTEM = """You answer questions using one document from a private archive: {name}.
+Reach the document only through the tools.
+
+How to work:
+- Search before answering. Try a few phrasings, codes or names if the first search misses.
+- Read a page before relying on it; search snippets are partial.
+- Pages marked OTHER VARIANT were written for a different variant. Use them only when no page covers this one, and say so.
+
+How to answer:
+- Cite each fact from the document with its page id in square brackets right after it, like [p:123].
+- Copy figures, specifications and identifiers exactly, with units.
+- Keep the document's warnings and cautions.
+- If the document doesn't cover it, say so plainly. You may add general knowledge, clearly labelled, without citations.
+- Use Markdown. Steps as numbered lists. Be concise.
+- Figures appear in page text as [figure N]; the user sees the figures of cited pages, so point to them by page.
+
+Top-level sections of this document: {sections}"""
+
+
+def system_prompt(d):
+    sections = ", ".join(json.loads(d["sections"] or "[]")) or "(see list_sections)"
+    return (S["system_prompt"] or SYSTEM).replace("{name}", d["name"]).replace("{sections}", sections)
+
+
+# ---------------------------------------------------------------- providers
+
+# Standard-tier text prices, USD per million tokens: (input, cached input, output);
+# None where the source didn't state a cached-input price.
+# Copied from the providers' pricing pages in October 2026 (platform.claude.com, and
+# developers.openai.com/api/docs/pricing); gpt-5.6-sol's is a promotion through at
+# least 2026-11-21. Prices change: override or add models with `prices:` in the config.
+PRICES = {
+    "claude-fable-5-1": (10.00, 0.25, 50.00), "claude-fable-5": (10.00, None, 50.00),
+    "claude-opus-5-5": (4.00, 0.20, 20.00), "claude-opus-5": (5.00, None, 25.00),
+    "claude-opus-4-8": (5.00, None, 25.00), "claude-opus-4-7": (5.00, None, 25.00),
+    "claude-opus-4-6": (5.00, None, 25.00), "claude-sonnet-5": (2.00, 0.20, 10.00),
+    "claude-sonnet-4-6": (3.00, None, 15.00), "claude-haiku-4-5": (1.00, 0.10, 5.00),
+    "gpt-6-astra": (10.00, 1.00, 50.00), "gpt-6.1-sol": (2.00, 0.10, 10.00), "gpt-6-sol": (2.00, 0.20, 10.00),
+    "gpt-6-luna": (0.10, 0.01, 0.50), "gpt-5.6-sol": (4.00, 0.40, 20.00), "gpt-5.6-terra": (2.00, 0.20, 12.00),
+    "gpt-5.6-luna": (0.20, 0.02, 1.20), "gpt-5.5": (5.00, 0.50, 30.00), "gpt-5.5-pro": (30.00, None, 180.00),
+    "gpt-5.4": (2.50, 0.25, 15.00), "gpt-5.4-mini": (0.75, 0.075, 4.50), "gpt-5.4-nano": (0.20, 0.02, 1.25),
+    "gpt-5.4-pro": (30.00, None, 180.00), "gpt-5.2": (1.75, 0.175, 14.00), "gpt-5.2-pro": (21.00, None, 168.00),
+    "gpt-5.1": (1.25, 0.125, 10.00), "gpt-5": (1.25, 0.125, 10.00), "gpt-5-mini": (0.25, 0.025, 2.00),
+    "gpt-5-nano": (0.05, 0.005, 0.40), "gpt-5-pro": (15.00, None, 120.00), "gpt-4.1": (2.00, 0.50, 8.00),
+    "gpt-4.1-mini": (0.40, 0.10, 1.60), "gpt-4.1-nano": (0.10, 0.025, 0.40), "gpt-4o": (2.50, 1.25, 10.00),
+    "gpt-4o-2024-05-13": (5.00, None, 15.00), "gpt-4o-mini": (0.15, 0.075, 0.60), "o1": (15.00, 7.50, 60.00),
+    "o1-pro": (150.00, None, 600.00), "o3-pro": (20.00, None, 80.00), "o3": (2.00, 0.50, 8.00),
+    "o4-mini": (1.10, 0.275, 4.40), "o3-mini": (1.10, 0.55, 4.40),
+}
+# A listed model may come back with a snapshot date or "-latest"; anything else after
+# the name (e.g. "-deep-research") is a different model with its own price.
+SNAPSHOT_RE = re.compile(r"(-\d{4}-\d{2}-\d{2}|-\d{8}|-latest)?$")
+
+
+def price(model):
+    """{"input", "cached", "output"} in USD per million tokens, or None if unknown."""
+    table = dict(PRICES)
+    for name, p in (S.get("prices") or {}).items():
+        table[str(name)] = (p.get("input"), p.get("cached"), p.get("output")) if isinstance(p, dict) else None
+    best = None
+    for name, p in table.items():
+        if p and model.startswith(name) and SNAPSHOT_RE.fullmatch(model[len(name):]):
+            if best is None or len(name) > len(best[0]):
+                best = (name, p)
+    if not best:
+        return None
+    return dict(zip(("input", "cached", "output"), best[1]))
+
+
+def priced(ids):
+    return [{"id": m, "price": price(m)} for m in ids]
+
+
+def list_models(provider, key):
+    if provider == "anthropic":
+        import anthropic
+        c = anthropic.Anthropic(api_key=key, max_retries=1, timeout=20)
+        return [m.id for m in c.models.list(limit=100)]
+    import openai
+    c = openai.OpenAI(api_key=key, max_retries=1, timeout=20)
+    skip = ("audio", "realtime", "transcribe", "tts", "image", "search", "instruct", "embedding",
+            "moderation", "dall-e", "whisper", "codex", "computer")
+    ids = [m.id for m in c.models.list()
+           if re.match(r"(gpt-|o\d|chatgpt-)", m.id) and not any(s in m.id for s in skip)]
+    return sorted(ids, reverse=True)
+
+
+def provider_error(e):
+    """Short, user-facing text for SDK errors (never echo the key)."""
+    status = getattr(e, "status_code", None)
+    if status == 401:
+        return "The provider rejected your API key. Check it in settings."
+    if status == 403:
+        return "Your API key isn't allowed to use this model."
+    if status == 404:
+        return "The provider doesn't know that model. Pick another in settings."
+    if status == 429:
+        return "The provider says you're over your rate limit or out of credit. Try again shortly."
+    msg = getattr(e, "message", None) or str(e)
+    return "Provider error%s: %s" % (" %s" % status if status else "", msg[:300])
+
+
+def chat_anthropic(key, model, system, history, doc, emit):
+    import anthropic
+    c = anthropic.Anthropic(api_key=key, max_retries=2, timeout=300)
+    tools = [{"name": t["name"], "description": t["description"], "input_schema": t["schema"]} for t in TOOLS]
+    msgs = [{"role": m["role"], "content": m["content"]} for m in history]
+    text = []
+    for rnd in range(MAX_TOOL_ROUNDS + 1):
+        extra = {"tool_choice": {"type": "none"}} if rnd == MAX_TOOL_ROUNDS else {}
+        if text and not text[-1].endswith("\n"):
+            text.append("\n\n")
+            emit("text", "\n\n")
+        with c.messages.stream(model=model, max_tokens=8192, system=system, messages=msgs, tools=tools,
+                               cache_control={"type": "ephemeral"}, **extra) as s:
+            for ev in s:
+                if ev.type == "text":
+                    text.append(ev.text)
+                    emit("text", ev.text)
+            msg = s.get_final_message()
+        uses = [b for b in msg.content if b.type == "tool_use"]
+        if msg.stop_reason != "tool_use" or not uses:
+            break
+        msgs.append({"role": "assistant", "content": msg.content})
+        results = []
+        for b in uses:
+            emit("status", tool_status(b.name, b.input))
+            results.append({"type": "tool_result", "tool_use_id": b.id, "content": run_tool(doc, b.name, b.input)})
+        msgs.append({"role": "user", "content": results})
+    return "".join(text)
+
+
+def chat_openai(key, model, system, history, doc, emit):
+    import openai
+    c = openai.OpenAI(api_key=key, max_retries=2, timeout=300)
+    tools = [{"type": "function", "name": t["name"], "description": t["description"],
+              "parameters": t["schema"], "strict": False} for t in TOOLS]
+    items = [{"role": m["role"], "content": m["content"]} for m in history]
+    text = []
+    include = ["reasoning.encrypted_content"]   # store=False, so reasoning has to travel with the request
+    for rnd in range(MAX_TOOL_ROUNDS + 1):
+        extra = {"tool_choice": "none"} if rnd == MAX_TOOL_ROUNDS else {}
+        if text and not text[-1].endswith("\n"):
+            text.append("\n\n")
+            emit("text", "\n\n")
+        try:
+            with c.responses.stream(model=model, instructions=system, input=items, tools=tools, store=False,
+                                    include=include, **extra) as s:
+                for ev in s:
+                    if ev.type == "response.output_text.delta":
+                        text.append(ev.delta)
+                        emit("text", ev.delta)
+                r = s.get_final_response()
+        except openai.BadRequestError as e:
+            if include and not text and any(w in str(e).lower() for w in ("encrypted", "include")):
+                include = []          # non-reasoning model
+                continue
+            raise
+        calls = [o for o in r.output if o.type == "function_call"]
+        if not calls:
+            break
+        items += [o.model_dump(exclude_none=True) for o in r.output]
+        for call in calls:
+            try:
+                args = json.loads(call.arguments or "{}")
+            except ValueError:
+                args = {}
+            emit("status", tool_status(call.name, args))
+            items.append({"type": "function_call_output", "call_id": call.call_id,
+                          "output": run_tool(doc, call.name, args)})
+    return "".join(text)
+
+
+# ---------------------------------------------------------------- API keys at rest
+
+class Keys:
+    def __init__(self):
+        from cryptography.fernet import Fernet
+        path = os.path.join(STATE_DIR, "keys.secret")
+        try:
+            with open(path, "rb") as f:
+                secret = f.read()
+        except FileNotFoundError:
+            secret = Fernet.generate_key()
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "wb") as f:
+                f.write(secret)
+        self.f = Fernet(secret)
+
+    def seal(self, key):
+        return self.f.encrypt(key.encode()).decode()
+
+    def unseal(self, token):
+        return self.f.decrypt(token.encode()).decode()
+
+
+# ---------------------------------------------------------------- HTTP
+
+CITE_RE = re.compile(r"\[p:(\d+)\]")
+
+
+def clean_history(raw):
+    """Earlier turns of the conversation, sent by the browser (which is where
+    conversations are kept). Alternating user/assistant, starting with the user
+    and ending with an answer, at most HISTORY_TURNS pairs."""
+    out = []
+    for m in raw if isinstance(raw, list) else []:
+        if not (isinstance(m, dict) and m.get("role") in ("user", "assistant")
+                and isinstance(m.get("content"), str) and m["content"].strip()):
+            continue
+        if (out[-1]["role"] if out else "assistant") == m["role"]:
+            continue          # keep turns alternating
+        out.append({"role": m["role"], "content": m["content"][:HISTORY_CHARS]})
+    if out and out[-1]["role"] == "user":
+        out.pop()             # a question that never got an answer
+    return out[-HISTORY_TURNS * 2:]
+
+
+class App:
+    def __init__(self):
+        self.catalog = Catalog(S["indexes"])
+        self.keys = Keys()
+        self.indexer = Indexer()
+
+    def doc(self, dpath):
+        r = idx().execute("SELECT * FROM docs WHERE path = ?", (dpath,)).fetchone()
+        d = dict(r) if r else {"path": dpath, "name": doc_name(dpath), "status": "new"}
+        p = self.indexer.progress.get(d.get("id"))
+        if p:
+            d["progress"] = {"fetched": p[0], "discovered": p[1], "indexed": p[2]}
+        return d
+
+    def settings(self, user):
+        r = adb().execute("SELECT * FROM users WHERE name = ?", (user,)).fetchone()
+        return dict(r) if r else {"name": user, "provider": None, "model": None, "key_enc": None,
+                                  "key_hint": None, "privacy_ack": None}
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    server_version = "tangerine-ask"
+    sys_version = ""
+    app: App = None
+
+    def log_message(self, *args):
+        pass
+
+    @property
+    def user(self):
+        if self.client_address[0] not in ("127.0.0.1", "::1"):
+            return None
+        return (self.headers.get("X-Tangerine-User") or "").strip() or None
+
+    def send(self, status, body=b"", ctype="application/json", cache="no-store"):
+        if not isinstance(body, bytes):
+            body = (json.dumps(body) if ctype == "application/json" else body).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", ctype + ("; charset=utf-8" if ctype.startswith(("text/", "application/j")) else ""))
+        self.send_header("Cache-Control", cache)
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def json_body(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        if n > 262144:
+            return None
+        try:
+            return json.loads(self.rfile.read(n) or b"{}")
+        except ValueError:
+            return None
+
+    def same_origin(self):
+        origin = urllib.parse.urlparse(self.headers.get("Origin", "")).netloc
+        return origin and origin == self.headers.get("Host")
+
+    def doc_path_or_404(self, raw):
+        d = canonical_doc_path(raw)
+        return d if d and d in self.app.catalog else None
+
+    def do_GET(self):
+        path, _, query = self.path.partition("?")
+        if path in ("/_ask/overlay.js", "/_ask/overlay.css"):
+            return self.static(path.rsplit("/", 1)[1])
+        user = self.user
+        if not user:
+            return self.send(401, {"error": "signed_out"})
+        qs = {k: v[0] for k, v in urllib.parse.parse_qs(query).items()}
+        if path == "/_ask/api/state":
+            return self.state(user, qs)
+        if path == "/_ask/api/models":
+            return self.models(user)
+        self.send(404, {"error": "not here"})
+
+    def do_POST(self):
+        path = self.path.partition("?")[0]
+        user = self.user
+        if not user:
+            return self.send(401, {"error": "signed_out"})
+        if not self.same_origin():
+            return self.send(403, {"error": "bad origin"})
+        body = self.json_body()
+        if body is None:
+            return self.send(400, {"error": "bad request"})
+        if path == "/_ask/api/settings":
+            return self.save_settings(user, body)
+        if path == "/_ask/api/privacy":
+            adb().execute("INSERT INTO users (name, privacy_ack) VALUES (?, ?) "
+                          "ON CONFLICT(name) DO UPDATE SET privacy_ack = excluded.privacy_ack", (user, time.time()))
+            return self.send(200, {"ok": True})
+        if path == "/_ask/api/index":
+            dpath = self.doc_path_or_404(body.get("path"))
+            if not dpath:
+                return self.send(404, {"error": "not a document this service can read"})
+            self.app.indexer.request(dpath)
+            return self.send(200, {"doc": self.app.doc(dpath)})
+        if path == "/_ask/api/ask":
+            return self.ask(user, body)
+        self.send(404, {"error": "not here"})
+
+    def static(self, name):
+        for d in (SHARE_DIR, os.path.dirname(os.path.abspath(__file__))):
+            p = os.path.join(d, name)
+            if os.path.isfile(p):
+                with open(p, "rb") as f:
+                    ctype = "text/css" if name.endswith(".css") else "text/javascript"
+                    return self.send(200, f.read(), ctype, cache="private, max-age=300")
+        self.send(404, {"error": "not here"})
+
+    def state(self, user, qs):
+        dpath = self.doc_path_or_404(qs.get("path"))
+        st = self.app.settings(user)
+        out = {"user": user, "noun": S["noun"], "examples": S["examples"], "doc": None, "settings": {"provider": st["provider"], "model": st["model"],
+                                                           "price": price(st["model"]) if st["model"] else None,
+                                             "key_hint": st["key_hint"], "privacy_ack": bool(st["privacy_ack"])}}
+        if dpath:
+            d = self.app.doc(dpath)
+            out["doc"] = {k: d.get(k) for k in ("path", "name", "status", "error", "pages", "progress")}
+        self.send(200, out)
+
+    def models(self, user):
+        st = self.app.settings(user)
+        if not st["key_enc"]:
+            return self.send(400, {"error": "Save an API key first."})
+        try:
+            return self.send(200, {"models": priced(list_models(st["provider"], self.app.keys.unseal(st["key_enc"])))})
+        except Exception as e:
+            return self.send(502, {"error": provider_error(e)})
+
+    def save_settings(self, user, body):
+        provider = body.get("provider")
+        if provider not in PROVIDERS:
+            return self.send(400, {"error": "Pick a provider."})
+        st = self.app.settings(user)
+        db = adb()
+        db.execute("INSERT OR IGNORE INTO users (name) VALUES (?)", (user,))
+        key = (body.get("key") or "").strip()
+        models = None
+        if key:
+            if len(key) > 512 or not re.fullmatch(r"[\x21-\x7e]+", key):
+                return self.send(400, {"error": "That doesn't look like an API key."})
+            try:
+                models = list_models(provider, key)
+            except Exception as e:
+                return self.send(400, {"error": provider_error(e)})
+            db.execute("UPDATE users SET provider = ?, key_enc = ?, key_hint = ?, model = NULL WHERE name = ?",
+                       (provider, self.app.keys.seal(key), key[-4:], user))
+            log("settings: %s saved their %s key" % (user, provider))
+        elif provider != st["provider"]:
+            # Switching provider without a new key would pair the wrong key with it.
+            db.execute("UPDATE users SET provider = ?, key_enc = NULL, key_hint = NULL, model = NULL WHERE name = ?",
+                       (provider, user))
+        if body.get("model"):
+            db.execute("UPDATE users SET model = ? WHERE name = ?", (str(body["model"])[:100], user))
+        st = self.app.settings(user)
+        out = {"ok": True, "settings": {"provider": st["provider"], "model": st["model"], "key_hint": st["key_hint"],
+                                        "price": price(st["model"]) if st["model"] else None}}
+        if models is not None:
+            out["models"] = priced(models)
+        self.send(200, out)
+
+    def ask(self, user, body):
+        dpath = self.doc_path_or_404(body.get("path"))
+        question = (body.get("question") or "").strip()[:4000]
+        if not dpath or not question:
+            return self.send(400, {"error": "Need a document and a question."})
+        st = self.app.settings(user)
+        if not st["privacy_ack"]:
+            return self.send(400, {"error": "privacy"})
+        if not (st["key_enc"] and st["model"]):
+            return self.send(400, {"error": "Set your provider, API key and model in settings first."})
+        d = self.app.doc(dpath)
+        if d["status"] != "ready":
+            return self.send(409, {"error": "not_ready"})
+
+        history = clean_history(body.get("history")) + [{"role": "user", "content": question}]
+        idx().execute("UPDATE docs SET questions = questions + 1, last_asked = ? WHERE id = ?",
+                      (time.time(), d["id"]))
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+        self.close_connection = True
+        alive = [True]
+
+        def emit(kind, data):
+            if not alive[0]:
+                raise ConnectionError("client went away")
+            try:
+                self.wfile.write(("data: %s\n\n" % json.dumps({"type": kind, "data": data})).encode())
+                self.wfile.flush()
+            except OSError:
+                alive[0] = False
+                raise ConnectionError("client went away")
+
+        doc = Doc(d)
+        system = system_prompt(d)
+        key = self.app.keys.unseal(st["key_enc"])
+        run = chat_anthropic if st["provider"] == "anthropic" else chat_openai
+        answer, err = "", None
+        try:
+            answer = run(key, st["model"], system, history, doc, emit)
+        except ConnectionError:
+            err = "disconnected"
+        except Exception as e:
+            err = provider_error(e)
+            log("ask: %s on %s failed: %r" % (user, dpath, e))
+        cited = []
+        for pid in dict.fromkeys(int(x) for x in CITE_RE.findall(answer)):
+            meta = doc.seen.get(pid) or doc._remember(pid)
+            if meta:
+                cited.append(meta)
+        try:
+            if err and err != "disconnected":
+                emit("error", err)
+            emit("sources", cited)
+            emit("done", None)
+        except ConnectionError:
+            pass
+
+
+def serve():
+    os.makedirs(STATE_DIR, exist_ok=True)
+    upgrade_index_layout()
+    Handler.app = App()
+    host, _, port = S["listen"].rpartition(":")
+    srv = http.server.ThreadingHTTPServer((host.strip("[]"), int(port)), Handler)
+    srv.daemon_threads = True
+    log("tangerine-ask listening on %s; index %.2f GB of %s GB (evicting at %d%%)"
+        % (S["listen"], index_used_bytes(idx()) / 1e9, S["index_max_gb"], S["evict_at"] * 100))
+    srv.serve_forever()
+
+
+def main():
+    import argparse
+    global S
+    ap = argparse.ArgumentParser(prog="tangerine-ask")
+    ap.add_subparsers(dest="cmd", required=True).add_parser("serve")
+    ap.parse_args()
+    with open(CONFIG_FILE) as f:
+        S = {**DEFAULTS, **(yaml.safe_load(f) or {})}
+    serve()
+
+
+if __name__ == "__main__":
+    main()

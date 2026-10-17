@@ -8,6 +8,7 @@ Safe to re-run: files are only replaced (and services only restarted) when they 
 """
 import argparse
 import grp
+import hashlib
 import os
 import re
 import shutil
@@ -20,6 +21,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 TEMPLATES = os.path.join(HERE, "templates")
 APP_BINARY = os.path.join(HERE, "build", "tangerine-server")
 ETC = "/etc/tangerine"
+ASK_VENV = "/opt/tangerine-ask/venv"
+ASK_SHARE = "/usr/local/share/tangerine-ask"
 ACME_ROOT = "/var/www/letsencrypt"
 
 DEFAULTS = {
@@ -27,6 +30,8 @@ DEFAULTS = {
             "footer_phrase": "made with 100% pulp",
             "bundles": True, "logout_link": True, "memory_max": "12G", "listen": "127.0.0.1:8081"},
     "gate": {"listen": "127.0.0.1:8082", "geoip": True},
+    "ask": {"enabled": False, "indexes": [], "listen": "127.0.0.1:8083", "crawl_listen": "127.0.0.1:8084",
+            "index_max_gb": 30, "evict_at": 0.9},
     "nginx": {"catch_all": True, "requests_per_second": 40, "logins_per_minute": 10},
     "tls": {"certbot": True, "email": ""},
     "fail2ban": False,
@@ -52,10 +57,40 @@ CATCH_ALL_HTTPS = """server {
 }
 """
 
-LOGOUT_LINK = """        # Uncompressed upstream so sub_filter can add a logout link to every page.
+PAGE_INJECT = """        # Uncompressed upstream so sub_filter can add to every page.
         proxy_set_header Accept-Encoding "";
-        sub_filter '</body>' '<a href="/_gate/logout" style="position:fixed;right:10px;bottom:10px;font:12px system-ui,sans-serif;color:#e8741c;background:#fff9;padding:3px 8px;border-radius:8px;text-decoration:none">log out</a></body>';
+        sub_filter '</body>' '%s</body>';
         sub_filter_once on;
+"""
+LOGOUT_LINK = ('<a href="/_gate/logout" style="position:fixed;right:10px;bottom:10px;font:12px system-ui,sans-serif;'
+               'color:#e8741c;background:#fff9;padding:3px 8px;border-radius:8px;text-decoration:none">log out</a>')
+ASK_SCRIPT = '<script src="/_ask/overlay.js" defer></script>'
+
+ASK_UPSTREAM = "upstream tangerine_ask  { server %s; keepalive 8; }\n"
+ASK_LOCATION = """    # Questions to an LLM about the document being viewed. Same sign-in as the archive;
+    # the gate's answer tells tangerine-ask who is asking.
+    location /_ask/ {
+        auth_request /_gate/check;
+        auth_request_set $tangerine_user $upstream_http_x_tangerine_user;
+        error_page 401 = @ask_signed_out;
+
+        proxy_pass http://tangerine_ask;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Tangerine-User $tangerine_user;
+        # Answers stream in as they're written.
+        proxy_buffering off;
+        proxy_read_timeout 600s;
+        client_max_body_size 256k;   # questions carry the conversation so far
+    }
+
+    # fetch() can't follow the login redirect, so the overlay gets a plain 401.
+    location @ask_signed_out {
+        default_type application/json;
+        return 401 '{"error":"signed_out"}';
+    }
 """
 
 
@@ -103,12 +138,40 @@ def load(path):
             errors.append("users: %r -- names are 1-32 chars of a-z 0-9 _ . -" % name)
     if not c["tls"]["certbot"] and not (c["tls"].get("certificate") and c["tls"].get("certificate_key")):
         errors.append("tls: with certbot: false, set certificate and certificate_key")
-    for key in ("app", "gate"):
-        if not re.fullmatch(r"127\.0\.0\.1:\d+|\[::1\]:\d+|localhost:\d+", str(c[key]["listen"])):
-            errors.append("%s.listen: must be a localhost address, the gate is the only thing guarding it" % key)
+    for key, field in (("app", "listen"), ("gate", "listen"), ("ask", "listen"), ("ask", "crawl_listen")):
+        if not re.fullmatch(r"127\.0\.0\.1:\d+|\[::1\]:\d+|localhost:\d+", str(c[key][field])):
+            errors.append("%s.%s: must be a localhost address, the gate is the only thing guarding it" % (key, field))
+    if c["ask"]["enabled"]:
+        if not c["ask"]["indexes"]:
+            errors.append("ask.indexes: list the app.indexes entries tangerine-ask should read")
+        for p in c["ask"]["indexes"]:
+            if p not in c["app"]["indexes"]:
+                errors.append("ask.indexes: %s is not one of app.indexes" % p)
+        if not float(c["ask"]["index_max_gb"]) > 0:
+            errors.append("ask.index_max_gb: must be more than 0")
+        if not 0 < float(c["ask"]["evict_at"]) <= 1:
+            errors.append("ask.evict_at: a fraction between 0 and 1, e.g. 0.9")
     if errors:
         die("config problems:\n  " + "\n  ".join(errors))
     return c
+
+
+def ask_config(c):
+    a = c["ask"]
+    out = {
+        "listen": a["listen"], "crawl_url": "http://%s" % a["crawl_listen"], "indexes": a["indexes"],
+        "index_max_gb": float(a["index_max_gb"]), "evict_at": float(a["evict_at"]),
+    }
+    for key in ("noun", "examples", "system_prompt", "prices"):
+        if a.get(key):
+            out[key] = a[key]
+    return yaml.safe_dump(out, sort_keys=False, allow_unicode=True).encode()
+
+
+def systemd_exec(args):
+    """systemd quoting: double quotes, with backslash, quote and $ / % escaped"""
+    return " ".join('"%s"' % a.replace("\\", "\\\\").replace('"', '\\"').replace("$", "$$").replace("%", "%%")
+                    for a in args)
 
 
 def cert_paths(c):
@@ -126,10 +189,15 @@ def render_all(c):
     if not app["bundles"]:
         args.append("--disable-bundles")
     args += app["indexes"]
-    # systemd quoting: double quotes, with backslash, quote and $ / % escaped
-    exec_line = " ".join('"%s"' % a.replace("\\", "\\\\").replace('"', '\\"').replace("$", "$$").replace("%", "%%")
-                         for a in args)
+    exec_line = systemd_exec(args)
+    # The crawler's copy: no --production, so no rate limits (and it trusts no X-Real-IP).
+    # Only tangerine-ask talks to it; nginx never routes there.
+    crawl_exec = systemd_exec(["/usr/local/bin/tangerine-server", "--listen-address", c["ask"]["crawl_listen"],
+                               "--site-name", app["site_name"], "--slogan", app["slogan"],
+                               "--latin-phrase", app["footer_phrase"], "--disable-bundles"] + c["ask"]["indexes"])
     cert, key = cert_paths(c)
+    ask = c["ask"]["enabled"]
+    inject = (LOGOUT_LINK if app["logout_link"] else "") + (ASK_SCRIPT if ask else "")
     values = {
         "domain": c["domain"],
         "app_listen": app["listen"],
@@ -140,8 +208,13 @@ def render_all(c):
         "catch_all_https": CATCH_ALL_HTTPS if c["nginx"]["catch_all"] else "",
         "ssl_certificate": cert,
         "ssl_certificate_key": key,
-        "logout_link": LOGOUT_LINK if app["logout_link"] else "",
+        "page_inject": PAGE_INJECT % inject if inject else "",
+        "ask_upstream": ASK_UPSTREAM % c["ask"]["listen"] if ask else "",
+        "ask_location": ASK_LOCATION if ask else "",
+        "ask_data_dirs": " ".join(sorted({os.path.dirname(p) for p in c["ask"]["indexes"]})) if ask else "",
         "app_exec": exec_line,
+        "crawl_exec": crawl_exec,
+        "crawl_memory_max": "3G",
         "data_dirs": " ".join(sorted({os.path.dirname(p) for p in app["indexes"]})),
         "memory_max": str(app["memory_max"]),
     }
@@ -158,6 +231,9 @@ def render_all(c):
     }
     for unit in ("tangerine.service", "tangerine-gate.service", "tangerine-geoip.service", "tangerine-geoip.timer"):
         files["/etc/systemd/system/" + unit] = (render(unit), 0o644)
+    if ask:
+        files["/etc/systemd/system/tangerine-ask.service"] = (render("tangerine-ask.service"), 0o644)
+        files["/etc/systemd/system/tangerine-crawl.service"] = (render("tangerine-crawl.service"), 0o644)
     if c["fail2ban"]:
         files["/etc/fail2ban/filter.d/tangerine-gate.conf"] = (render("fail2ban-filter.conf"), 0o644)
         files["/etc/fail2ban/jail.d/tangerine-gate.conf"] = (render("fail2ban-jail.conf"), 0o644)
@@ -207,6 +283,30 @@ def ensure_user(name, comment):
         print("  created user %s" % name)
 
 
+def install_ask_venv():
+    """Create /opt/tangerine-ask/venv and (re)install the SDKs when requirements.txt changes."""
+    reqs = read(os.path.join(HERE, "ask", "requirements.txt"))
+    stamp = os.path.join(ASK_VENV, ".requirements.sha256")
+    want = hashlib.sha256(reqs).hexdigest()
+    try:
+        if read(stamp).decode().strip() == want:
+            return False
+    except FileNotFoundError:
+        pass
+    cfg = os.path.join(ASK_VENV, "pyvenv.cfg")
+    if os.path.exists(cfg) and "include-system-site-packages = true" in read(cfg).decode():
+        # Older installs shared the distro's packages, which pip can't keep consistent.
+        shutil.rmtree(ASK_VENV)
+    if not os.path.exists(os.path.join(ASK_VENV, "bin", "python")):
+        run("/usr/bin/python3", "-m", "venv", ASK_VENV)
+    run(os.path.join(ASK_VENV, "bin", "pip"), "install", "--quiet", "--upgrade", "-r",
+        os.path.join(HERE, "ask", "requirements.txt"))
+    with open(stamp, "w") as f:
+        f.write(want + "\n")
+    print("  installed tangerine-ask's Python packages into %s" % ASK_VENV)
+    return True
+
+
 # ---------------------------------------------------------------- main
 
 def main():
@@ -243,6 +343,9 @@ def main():
         print("  note: python3-maxminddb not installed; logins will be logged without locations")
     if not os.path.isfile(APP_BINARY):
         die("%s missing -- run ./build.sh first" % APP_BINARY)
+    if c["ask"]["enabled"]:
+        if run("/usr/bin/python3", "-c", "import venv, ensurepip", check=False, quiet=True).returncode:
+            die("ask.enabled needs Python's venv module (Debian: apt install python3-venv)")
 
     say("users")
     ensure_user("tangerine", "tangerine archive server")
@@ -250,30 +353,55 @@ def main():
     for p in c["app"]["indexes"]:
         if run("runuser", "-u", "tangerine", "--", "test", "-r", p, check=False).returncode:
             die("the tangerine user can't read %s (check permissions on it and its parent directories)" % p)
+    if c["ask"]["enabled"]:
+        ensure_user("tangerine-ask", "tangerine LLM questions")
+        for p in c["ask"]["indexes"]:
+            if run("runuser", "-u", "tangerine-ask", "--", "test", "-r", p, check=False).returncode:
+                die("the tangerine-ask user can't read %s" % p)
 
     say("programs")
     app_changed = put("/usr/local/bin/tangerine-server", read(APP_BINARY), 0o755)
     gate_changed = put("/usr/local/bin/tangerine-gate", read(os.path.join(HERE, "gate", "tangerine-gate")), 0o755)
     put("/usr/local/bin/tangerine-geoip-update", read(os.path.join(HERE, "gate", "tangerine-geoip-update")), 0o755)
+    ask_changed = False
+    if c["ask"]["enabled"]:
+        ask_changed |= install_ask_venv()
+        ask_changed |= put("/usr/local/bin/tangerine-ask", read(os.path.join(HERE, "ask", "tangerine-ask")), 0o755)
+        for name in ("overlay.js", "overlay.css"):
+            ask_changed |= put(ASK_SHARE + "/" + name, read(os.path.join(HERE, "ask", name)), 0o644)
 
     say("config")
     os.makedirs(ETC, mode=0o755, exist_ok=True)
     gate_changed |= put(ETC + "/config.yaml", read(a.config), 0o640, group="tangerine-gate")
     if not os.path.exists(ETC + "/passwords"):
         put(ETC + "/passwords", b"", 0o640, group="tangerine-gate")
+    if c["ask"]["enabled"]:
+        # Its own small config: tangerine-ask has no business reading the gate's.
+        ask_changed |= put(ETC + "/ask.yaml", ask_config(c), 0o640, group="tangerine-ask")
 
     say("services")
     units = {d: files.pop(d) for d in list(files) if d.startswith("/etc/systemd/")}
+    crawl_changed = False
     for dest, (content, mode) in units.items():
         changed = put(dest, content, mode)
         app_changed |= changed and dest.endswith("/tangerine.service")
         gate_changed |= changed and dest.endswith("/tangerine-gate.service")
+        ask_changed |= changed and dest.endswith("/tangerine-ask.service")
+        crawl_changed |= changed and dest.endswith("/tangerine-crawl.service")
     run("systemctl", "daemon-reload")
     run("systemctl", "enable", "--now", "tangerine.service", "tangerine-gate.service")
     if app_changed:
         run("systemctl", "restart", "tangerine.service")
     if gate_changed:
         run("systemctl", "restart", "tangerine-gate.service")
+    if c["ask"]["enabled"]:
+        run("systemctl", "enable", "--now", "tangerine-crawl.service", "tangerine-ask.service")
+        if app_changed or crawl_changed:   # same binary as the archive server
+            run("systemctl", "restart", "tangerine-crawl.service")
+        if ask_changed:
+            run("systemctl", "restart", "tangerine-ask.service")
+    else:
+        run("systemctl", "disable", "--now", "tangerine-ask.service", "tangerine-crawl.service", check=False, quiet=True)
     if c["gate"]["geoip"]:
         run("systemctl", "enable", "--now", "tangerine-geoip.timer")
         if not os.path.exists("/var/lib/tangerine-gate/dbip-city-lite.mmdb"):
@@ -328,7 +456,8 @@ def main():
         run("fail2ban-client", "reload", check=False)
 
     say("done")
-    run("systemctl", "--no-pager", "--lines=0", "status", "tangerine", "tangerine-gate", "nginx", check=False)
+    run("systemctl", "--no-pager", "--lines=0", "status", "tangerine", "tangerine-gate", "nginx",
+        *(["tangerine-ask", "tangerine-crawl"] if c["ask"]["enabled"] else []), check=False)
     have_pw = {line.split(":", 1)[0] for line in read(ETC + "/passwords").decode().splitlines()}
     no_pw = [u for u in c["users"] if u not in have_pw]
     print("\nSite: https://%s/   Door log: https://%s/_gate/admin" % (c["domain"], c["domain"]))
