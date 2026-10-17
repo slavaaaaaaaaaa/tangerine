@@ -302,7 +302,7 @@
   // "$2 in / $10 out per 1M tokens"
   const money = (n) => "$" + (n >= 1 ? n.toFixed(2).replace(/\.00$/, "") : String(+n.toFixed(3)));
   const priceText = (p) => p && p.input != null && p.output != null
-    ? money(p.input) + " in / " + money(p.output) + " out per 1M tokens" : "";
+    ? money(p.input) + " in / " + money(p.output) + " out per 1M tokens" + (p.note ? " (" + p.note + ")" : "") : "";
   function showModel() {
     const s = st.settings;
     const p = priceText(s.price);

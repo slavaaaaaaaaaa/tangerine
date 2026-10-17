@@ -632,17 +632,22 @@ def system_prompt(d):
 
 # ---------------------------------------------------------------- providers
 
-# Standard-tier text prices, USD per million tokens: (input, cached input, output);
-# None where the source didn't state a cached-input price.
-# Copied from the providers' pricing pages in October 2026 (platform.claude.com, and
-# developers.openai.com/api/docs/pricing); gpt-5.6-sol's is a promotion through at
-# least 2026-11-21. Prices change: override or add models with `prices:` in the config.
+# Standard-tier text prices, USD per million tokens: (input, cached input, output),
+# optionally with a note. Copied from the providers' pricing pages on 2026-10-17
+# (platform.claude.com/docs/en/about-claude/pricing and developers.openai.com/api/docs/pricing);
+# gpt-5.6-sol's is a promotion through at least 2026-11-21. Prices change: override or
+# add models with `prices:` in the config. None means the page gave no cached price.
 PRICES = {
-    "claude-fable-5-1": (10.00, 0.25, 50.00), "claude-fable-5": (10.00, None, 50.00),
-    "claude-opus-5-5": (4.00, 0.20, 20.00), "claude-opus-5": (5.00, None, 25.00),
-    "claude-opus-4-8": (5.00, None, 25.00), "claude-opus-4-7": (5.00, None, 25.00),
-    "claude-opus-4-6": (5.00, None, 25.00), "claude-sonnet-5": (2.00, 0.20, 10.00),
-    "claude-sonnet-4-6": (3.00, None, 15.00), "claude-haiku-4-5": (1.00, 0.10, 5.00),
+    "claude-fable-5-1": (10.00, 0.25, 50.00), "claude-fable-5": (10.00, 1.00, 50.00),
+    "claude-opus-5-5": (4.00, 0.20, 20.00), "claude-opus-5": (5.00, 0.50, 25.00),
+    "claude-opus-4-8": (5.00, 0.50, 25.00), "claude-opus-4-7": (5.00, 0.50, 25.00),
+    "claude-opus-4-6": (5.00, 0.50, 25.00), "claude-opus-4-5": (5.00, 0.50, 25.00),
+    "claude-opus-4-1": (15.00, 1.50, 75.00), "claude-opus-4": (15.00, 1.50, 75.00),
+    "claude-sonnet-5-5": (2.00, 0.10, 10.00), "claude-sonnet-5": (2.00, 0.20, 10.00),
+    "claude-sonnet-4-6": (3.00, 0.30, 15.00), "claude-sonnet-4-5": (3.00, 0.30, 15.00),
+    "claude-sonnet-4": (3.00, 0.30, 15.00),
+    "claude-haiku-5-5": (0.10, 0.01, 0.50, "prompts up to 100K tokens; $0.50 in / $2.50 out above"),
+    "claude-haiku-4-5": (1.00, 0.10, 5.00), "claude-3-5-haiku": (0.80, 0.08, 4.00),
     "gpt-6-astra": (10.00, 1.00, 50.00), "gpt-6.1-sol": (2.00, 0.10, 10.00), "gpt-6-sol": (2.00, 0.20, 10.00),
     "gpt-6-luna": (0.10, 0.01, 0.50), "gpt-5.6-sol": (4.00, 0.40, 20.00), "gpt-5.6-terra": (2.00, 0.20, 12.00),
     "gpt-5.6-luna": (0.20, 0.02, 1.20), "gpt-5.5": (5.00, 0.50, 30.00), "gpt-5.5-pro": (30.00, None, 180.00),
@@ -664,7 +669,8 @@ def price(model):
     """{"input", "cached", "output"} in USD per million tokens, or None if unknown."""
     table = dict(PRICES)
     for name, p in (S.get("prices") or {}).items():
-        table[str(name)] = (p.get("input"), p.get("cached"), p.get("output")) if isinstance(p, dict) else None
+        table[str(name)] = ((p.get("input"), p.get("cached"), p.get("output"), p.get("note"))
+                            if isinstance(p, dict) else None)
     best = None
     for name, p in table.items():
         if p and model.startswith(name) and SNAPSHOT_RE.fullmatch(model[len(name):]):
@@ -672,7 +678,7 @@ def price(model):
                 best = (name, p)
     if not best:
         return None
-    return dict(zip(("input", "cached", "output"), best[1]))
+    return dict(zip(("input", "cached", "output", "note"), tuple(best[1]) + (None,) * (4 - len(best[1]))))
 
 
 def priced(ids):
